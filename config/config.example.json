@@ -1,0 +1,9 @@
+{
+  "guild_id": "YOUR_DISCORD_SERVER_ID",
+  "allowed_users": ["YOUR_DISCORD_USER_ID"],
+  "model": null,
+  "notification_port": 8787,
+  "max_message_length": 1900,
+  "thinking_mode": "streaming",
+  "auto_archive_override": true
+}

@@ -1,0 +1,1765 @@
+#!/usr/bin/env python3
+"""
+Discord-Zo Bridge Bot
+
+A Discord bot that creates threaded conversations with Zo, maintaining
+persistent sessions, channel-specific context, interactive buttons,
+status tracking, and file attachments.
+"""
+
+import asyncio
+import discord
+from discord.ext import commands
+from discord import ui
+from aiohttp import web
+import json
+import os
+import re
+import sys
+import logging
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from db import (
+    init_db, save_mapping, get_conversation_id, update_activity,
+    get_active_threads, update_thread_name, update_conversation_id,
+    get_channel_config, set_channel_config, delete_channel_config,
+    update_thread_status, get_thread_status, get_mapping_by_conversation,
+    set_watched, is_watched, get_all_watched_threads
+)
+from zo_client import ZoClient, load_config
+from commands import setup_commands
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+CONFIG = load_config()
+
+STATUS_EMOJI = {
+    "error": "\u274c",
+}
+
+_STATUS_EMOJI_PATTERN = re.compile(r'^(?:\u274c)\s*')
+
+
+def set_thread_status_prefix(name: str, status: str | None) -> str:
+    """Add or replace status emoji prefix on thread name."""
+    cleaned = _STATUS_EMOJI_PATTERN.sub('', name)
+    if status and status in STATUS_EMOJI:
+        return f"{STATUS_EMOJI[status]} {cleaned}"
+    return cleaned
+
+
+def strip_status_prefix(name: str) -> str:
+    """Remove status emoji prefix from thread name."""
+    return _STATUS_EMOJI_PATTERN.sub('', name)
+
+
+DISCORD_BASE_DIR = Path(CONFIG.get("data_dir", "discord_data")).resolve()
+
+
+def get_channel_dir(channel_name: str) -> Path:
+    """Get or create the Discord/{channel}/ directory."""
+    safe_name = re.sub(r'[^\w\-]', '_', channel_name.lower()).strip('_')
+    channel_dir = DISCORD_BASE_DIR / safe_name
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    return channel_dir
+
+
+def get_attachments_dir(channel_name: str) -> Path:
+    """Get or create the Discord/{channel}/attachments/ directory."""
+    att_dir = get_channel_dir(channel_name) / "attachments"
+    att_dir.mkdir(parents=True, exist_ok=True)
+    return att_dir
+
+
+async def send_suppressed(channel, **kwargs):
+    """Send a message then immediately edit it to suppress link embeds.
+
+    Enforces Discord's 2000-char limit: if content exceeds the limit,
+    it's split into multiple messages automatically.
+    """
+    DISCORD_LIMIT = 2000
+    content = kwargs.get("content", "")
+
+    async def _send_chunk(chunk_content, is_first, ref_kwargs):
+        send_kwargs = {**ref_kwargs, "content": chunk_content}
+        if not is_first:
+            send_kwargs.pop("reference", None)
+            send_kwargs.pop("mention_author", None)
+        try:
+            msg = await channel.send(**send_kwargs)
+        except discord.HTTPException as e:
+            if e.code == 50035 and "Must be 2000 or fewer" in str(e):
+                logger.warning(f"send_suppressed: Discord rejected {len(chunk_content)} chars, hard-splitting")
+                msgs = []
+                remaining = chunk_content
+                first = is_first
+                while remaining:
+                    part = remaining[:DISCORD_LIMIT]
+                    remaining = remaining[DISCORD_LIMIT:]
+                    m = await _send_chunk(part, first, ref_kwargs)
+                    if m:
+                        msgs.append(m)
+                    first = False
+                return msgs[-1] if msgs else None
+            raise
+        try:
+            await msg.edit(suppress=True)
+        except Exception as edit_err:
+            logger.warning(f"Failed to suppress embeds on message {msg.id}: {edit_err}")
+        return msg
+
+    if len(content) <= DISCORD_LIMIT:
+        return await _send_chunk(content, True, kwargs)
+
+    logger.warning(f"send_suppressed: content is {len(content)} chars, splitting at {DISCORD_LIMIT}")
+    last_msg = None
+    is_first = True
+    while content:
+        chunk = content[:DISCORD_LIMIT]
+        content = content[DISCORD_LIMIT:]
+        last_msg = await _send_chunk(chunk, is_first, kwargs)
+        is_first = False
+    return last_msg
+
+
+class ButtonCallbackView(ui.View):
+    """A view with buttons that posts the user's choice back to the Zo conversation."""
+
+    def __init__(self, bot, thread_id: str, buttons: list[dict], timeout_seconds: int = 3600):
+        super().__init__(timeout=timeout_seconds)
+        self.bot = bot
+        self.thread_id = thread_id
+
+        for btn in buttons:
+            button = ui.Button(
+                label=btn["label"],
+                custom_id=btn.get("id", btn["label"].lower().replace(" ", "_")),
+                style=self._parse_style(btn.get("style", "primary")),
+            )
+            button.callback = self._make_callback(btn["label"], btn.get("id", btn["label"]))
+            self.add_item(button)
+
+    def _parse_style(self, style: str) -> discord.ButtonStyle:
+        styles = {
+            "primary": discord.ButtonStyle.primary,
+            "secondary": discord.ButtonStyle.secondary,
+            "success": discord.ButtonStyle.success,
+            "danger": discord.ButtonStyle.danger,
+        }
+        return styles.get(style, discord.ButtonStyle.primary)
+
+    def _make_callback(self, label: str, button_id: str):
+        async def callback(interaction: discord.Interaction):
+            await interaction.response.edit_message(
+                content=f"**{interaction.user.display_name}** selected: **{label}**",
+                view=None
+            )
+            conv_id = await get_conversation_id(self.thread_id)
+            if conv_id and conv_id != "":
+                thread = self.bot.get_channel(int(self.thread_id))
+                if thread:
+                    on_thinking = self.bot.make_on_thinking(thread)
+
+                    async def on_conv_id(cid: str):
+                        if cid != conv_id:
+                            await update_conversation_id(self.thread_id, cid)
+                        if self.thread_id in self.bot._inflight:
+                            self.bot._inflight[self.thread_id]["conv_id"] = cid
+
+                    task = asyncio.current_task()
+                    self.bot._inflight[self.thread_id] = {"conv_id": conv_id, "task": task}
+
+                    stop_event = asyncio.Event()
+                    typing_task = asyncio.create_task(self.bot.typing_loop(thread, stop_event))
+                    try:
+                        choice_msg = f"[Button pressed: {label} (id: {button_id})]"
+                        context, file_paths = await self.bot.build_thread_context(thread, include_source=False)
+                        result = await self.bot.zo.ask_stream(
+                            choice_msg,
+                            conversation_id=conv_id,
+                            context=context or None,
+                            file_paths=file_paths or None,
+                            on_thinking=on_thinking,
+                            on_conv_id=on_conv_id,
+                        )
+                        response, new_conv_id = result.output, result.conv_id
+                        if new_conv_id != conv_id:
+                            await update_conversation_id(self.thread_id, new_conv_id)
+                        await update_activity(self.thread_id)
+
+                        if not response or not response.strip():
+                            logger.warning(f"Empty response for button callback conv {conv_id} (interrupted={result.interrupted})")
+                            response, new_conv_id = await self.bot._retry_empty_response(
+                                self.thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
+                                interrupted=result.interrupted,
+                            )
+
+                        chunks = self.bot.zo.chunk_response(response)
+                        chunks = [c for c in chunks if c.strip()]
+                        if not chunks:
+                            logger.error(f"All retries exhausted for button callback conv {conv_id}")
+                            chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id or conv_id}`\n\nSend another message to try again."]
+                        for chunk in chunks:
+                            await send_suppressed(thread, content=chunk)
+                    except asyncio.CancelledError:
+                        logger.info(f"Button callback cancelled (interrupted) for thread {self.thread_id}")
+                    except Exception as e:
+                        logger.error(f"Button callback error: {e}")
+                        await self.bot.set_status(thread, "error")
+                    finally:
+                        self.bot._inflight.pop(self.thread_id, None)
+                        stop_event.set()
+                        await typing_task
+        return callback
+
+
+class ZoDiscordBot(commands.Bot):
+
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guilds = True
+        intents.members = True
+        intents.reactions = True
+
+        super().__init__(
+            intents=intents,
+            command_prefix="!zo "
+        )
+
+        self.zo = ZoClient()
+        self.config = CONFIG
+        self.http_app = None
+        self.http_runner = None
+        self._initialized = False
+        self.queued_renames = {}
+        self._inflight = {}  # thread_id -> {"conv_id": str, "task": asyncio.Task}
+        self._message_queues = {}  # thread_id -> asyncio.Queue of discord.Message
+        self._bundled_prefixes = {}  # message.id -> str, for passing context to handle_thread_message
+        self._thinking_mode = self.config.get("thinking_mode", "streaming")
+        self._auto_archive_override = self.config.get("auto_archive_override", True)
+
+        setup_commands(self)
+
+    async def on_ready(self):
+        if not self._initialized:
+            self._initialized = True
+            await init_db()
+            logger.info("Database initialized")
+            await self.start_http_server()
+            self._start_thread_watcher()
+
+        logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+        logger.info(f"Connected to {len(self.guilds)} guild(s)")
+        for guild in self.guilds:
+            logger.info(f"  - {guild.name} (ID: {guild.id})")
+
+    def _start_thread_watcher(self):
+        from discord.ext import tasks
+
+        @tasks.loop(hours=6)
+        async def bump_threads():
+            await self._bump_threads_routine()
+
+        self._thread_bump_task = bump_threads
+        bump_threads.start()
+        logger.info("Thread watcher bump routine started (every 6 hours)")
+
+    async def _bump_threads_routine(self):
+        if not self._auto_archive_override:
+            logger.info("Thread watcher: auto-archive override disabled, skipping bump")
+            return
+
+        watched = await get_all_watched_threads()
+        if not watched:
+            logger.info("Thread watcher: no threads to bump")
+            return
+
+        bumped = 0
+        failed = 0
+        skipped = 0
+
+        for t in watched:
+            try:
+                thread = self.get_channel(int(t["thread_id"]))
+                if not thread or not isinstance(thread, discord.Thread):
+                    skipped += 1
+                    continue
+                if thread.archived or thread.locked:
+                    skipped += 1
+                    continue
+                if not thread.permissions_for(thread.guild.me).manage_threads:
+                    skipped += 1
+                    continue
+
+                new_duration = 4320 if thread.auto_archive_duration == 10080 else 10080
+                await thread.edit(auto_archive_duration=new_duration)
+                bumped += 1
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"Thread watcher: failed to bump {t['thread_id']}: {e}")
+                failed += 1
+
+        logger.info(f"Thread watcher bump complete: {bumped} bumped, {skipped} skipped, {failed} failed")
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Handle reactions for thread completion."""
+        if payload.user_id == self.user.id:
+            return
+
+        if str(payload.emoji) != "\u2705":
+            return
+
+        channel = self.get_channel(payload.channel_id)
+        if not isinstance(channel, discord.Thread):
+            return
+
+        conv_id = await get_conversation_id(str(channel.id))
+        if conv_id is None:
+            return
+
+        try:
+            await channel.fetch_message(payload.message_id)
+        except Exception:
+            return
+
+        logger.info(f"Checkmark reaction in thread '{channel.name}' - archiving")
+        try:
+            await set_watched(str(channel.id), False)
+            await channel.edit(archived=True)
+            logger.info(f"Archived thread {channel.id}")
+        except Exception as e:
+            logger.error(f"Failed to archive thread: {e}")
+
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread):
+        """Thread watcher: reverse auto-archives, respect manual archives."""
+        try:
+            conv_id = await get_conversation_id(str(after.id))
+            if conv_id is None:
+                return
+
+            if not before.archived and after.archived and not after.locked:
+                if not self._auto_archive_override:
+                    return
+
+                watched = await is_watched(str(after.id))
+                if not watched:
+                    logger.info(f"Thread watcher: thread {after.id} not watched, leaving archived")
+                    return
+
+                logger.info(f"Thread watcher: auto-archive detected on '{after.name}' ({after.id}), unarchiving")
+                try:
+                    await after.edit(archived=False, auto_archive_duration=10080)
+                except Exception as e:
+                    logger.error(f"Thread watcher: failed to unarchive {after.id}: {e}")
+
+            elif before.archived and not after.archived:
+                watched = await is_watched(str(after.id))
+                if not watched:
+                    logger.info(f"Thread watcher: thread {after.id} was un-archived, adding to watch list")
+                    await set_watched(str(after.id), True)
+        except Exception as e:
+            logger.error(f"Thread watcher on_thread_update error: {e}")
+
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+
+        allowed_users = self.config.get("allowed_users", [])
+        if allowed_users and str(message.author.id) not in allowed_users:
+            return
+
+        if isinstance(message.channel, discord.Thread):
+            await self.handle_thread_message(message)
+            return
+
+        if isinstance(message.channel, discord.TextChannel):
+            await self.handle_channel_message(message)
+            return
+
+    async def set_status(self, thread: discord.Thread, status: str):
+        """Update thread title with status emoji and save to DB."""
+        new_name = set_thread_status_prefix(thread.name, status)
+        try:
+            await asyncio.wait_for(thread.edit(name=new_name), timeout=10.0)
+            await update_thread_name(str(thread.id), new_name)
+            await update_thread_status(str(thread.id), status)
+        except (asyncio.TimeoutError, discord.HTTPException) as e:
+            is_rate_limit = isinstance(e, discord.HTTPException) and e.status == 429
+            reason = "Rate limited" if is_rate_limit else "Timeout"
+            logger.warning(f"{reason} setting status '{status}' on thread {thread.id} - will retry in background")
+            await update_thread_status(str(thread.id), status)
+            asyncio.create_task(self._retry_rename(thread, new_name, status))
+        except Exception as e:
+            logger.error(f"Failed to update status: {e}")
+
+    async def _retry_rename(self, thread: discord.Thread, new_name: str, status: str):
+        """Retry a thread rename after rate limit clears."""
+        await asyncio.sleep(60)
+        try:
+            current = await thread.guild.fetch_channel(thread.id)
+            expected_name = set_thread_status_prefix(current.name, status)
+            await asyncio.wait_for(current.edit(name=expected_name), timeout=30.0)
+            await update_thread_name(str(thread.id), expected_name)
+            logger.info(f"Retry rename succeeded for thread {thread.id}: {expected_name}")
+        except Exception as e:
+            logger.warning(f"Retry rename failed for thread {thread.id}: {e}")
+
+    async def handle_channel_message(self, message: discord.Message):
+        logger.info(f"New message in #{message.channel.name} from {message.author}")
+
+        attachment_paths = []
+        if message.attachments:
+            att_dir = get_attachments_dir(message.channel.name)
+            for att in message.attachments:
+                try:
+                    att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
+                    await att.save(att_path)
+                    attachment_paths.append(str(att_path))
+                except Exception as e:
+                    logger.error(f"Failed to save attachment: {e}")
+
+        # Create thread BEFORE calling Zo so thinking previews have somewhere to go
+        simple_title = self.zo.generate_thread_title_simple(message.content)
+        thread = await message.create_thread(
+            name=simple_title[:100],
+        )
+        thread_id = str(thread.id)
+
+        # Save mapping with empty conv_id — will be updated once streaming starts
+        await save_mapping(
+            thread_id=thread_id,
+            conversation_id="",
+            channel_id=str(message.channel.id),
+            guild_id=str(message.guild.id),
+            thread_name=simple_title[:100]
+        )
+
+        on_thinking = self.make_on_thinking(thread)
+
+        async def on_conv_id(cid: str):
+            await update_conversation_id(thread_id, cid)
+            if thread_id in self._inflight:
+                self._inflight[thread_id]["conv_id"] = cid
+
+        task = asyncio.current_task()
+        self._inflight[thread_id] = {"conv_id": "", "task": task}
+
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
+        try:
+            context, file_paths = await self.build_channel_context(message.channel)
+            if attachment_paths:
+                file_paths.extend(attachment_paths)
+
+            result = await self.zo.ask_stream(
+                message.content,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+            )
+            response, conv_id = result.output, result.conv_id
+
+            # Apply queued rename from Zo if available
+            # (Rename may have been queued mid-stream before DB mapping existed)
+            rename = self.queued_renames.pop(conv_id, None)
+            if rename:
+                try:
+                    await asyncio.wait_for(thread.edit(name=rename[:100]), timeout=10.0)
+                    await update_thread_name(thread_id, rename[:100])
+                except (asyncio.TimeoutError, discord.HTTPException) as e:
+                    logger.warning(f"Failed to apply queued rename: {e}")
+                    await update_thread_name(thread_id, rename[:100])
+
+            if not response or not response.strip():
+                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted})")
+                response, conv_id = await self._retry_empty_response(
+                    thread_id, conv_id, thread, on_thinking, on_conv_id,
+                    interrupted=result.interrupted,
+                )
+
+            chunks = self.zo.chunk_response(response)
+            chunks = [c for c in chunks if c.strip()]
+            if not chunks:
+                # All retries exhausted — show fallback
+                logger.error(f"All retries exhausted for conv {conv_id}")
+                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\nSend another message to try again."]
+            for chunk in chunks:
+                await send_suppressed(thread, content=chunk)
+            logger.info(f"Sent response in thread {thread.id}, conv_id {conv_id}")
+
+        except asyncio.CancelledError:
+            logger.info(f"Channel message request cancelled (interrupted) for thread {thread_id}")
+        except Exception as e:
+            logger.error(f"Error handling message: {e}", exc_info=True)
+            try:
+                await self.set_status(thread, "error")
+            except Exception:
+                pass
+        finally:
+            self._inflight.pop(thread_id, None)
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+            # Drain queued messages (user may have sent follow-ups in the
+            # thread while this channel-message turn was still running).
+            await self._drain_queue(thread_id)
+
+    def _get_channel_name_for_thread(self, thread: discord.Thread) -> str:
+        """Get the parent channel name for attachment saving."""
+        if thread.parent:
+            return thread.parent.name
+        return "unknown"
+
+    async def handle_thread_message(self, message: discord.Message):
+        thread = message.channel
+        thread_id = str(thread.id)
+
+        conv_id = await get_conversation_id(thread_id)
+        if conv_id is None:
+            return
+
+        logger.info(f"Message in thread '{thread.name}' from {message.author}")
+
+        # Queue: if there's an in-flight request for this thread, queue this
+        # message and let the current turn finish. The queue is drained after
+        # each turn completes.
+        inflight = self._inflight.get(thread_id)
+        if inflight:
+            logger.info(f"In-flight request for thread {thread_id}, queuing message from {message.author}")
+            if message.attachments:
+                saved_paths = []
+                channel_name = self._get_channel_name_for_thread(thread)
+                att_dir = get_attachments_dir(channel_name)
+                for att in message.attachments:
+                    try:
+                        att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
+                        await att.save(att_path)
+                        saved_paths.append(str(att_path))
+                    except Exception as e:
+                        logger.error(f"Failed to save queued attachment: {e}")
+                if saved_paths:
+                    message._presaved_attachments = saved_paths
+            if thread_id not in self._message_queues:
+                self._message_queues[thread_id] = asyncio.Queue()
+            await self._message_queues[thread_id].put(message)
+            await send_suppressed(thread, content=f"*Queued — will process after current turn finishes.*")
+            return
+
+        is_first_reply = conv_id == ""
+        context, file_paths = await self.build_thread_context(thread, include_source=is_first_reply)
+
+        if conv_id == "":
+            notification_texts = []
+            messages = []
+            async for msg in thread.history(limit=10, oldest_first=True):
+                messages.append(msg)
+
+            for msg in messages[1:] if len(messages) > 1 else messages:
+                if msg.author.bot:
+                    notification_texts.append(msg.content)
+
+            if notification_texts:
+                notification_context = "\n\n".join(notification_texts)
+                context = (context + "\n\n" if context else "") + "## Notification content:\n" + notification_context
+
+        # Use pre-saved attachments if this message was queued (CDN URLs may
+        # have expired), otherwise download them now.
+        attachment_paths = getattr(message, "_presaved_attachments", None) or []
+        if not attachment_paths and message.attachments:
+            channel_name = self._get_channel_name_for_thread(thread)
+            att_dir = get_attachments_dir(channel_name)
+            for att in message.attachments:
+                try:
+                    att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
+                    await att.save(att_path)
+                    attachment_paths.append(str(att_path))
+                except Exception as e:
+                    logger.error(f"Failed to save attachment: {e}")
+
+        if attachment_paths:
+            file_paths.extend(attachment_paths)
+
+        reply_context = ""
+        if message.reference and message.reference.message_id:
+            try:
+                ref_msg = await thread.fetch_message(message.reference.message_id)
+                ref_author = "Zo" if ref_msg.author.bot else ref_msg.author.display_name
+                ref_text = ref_msg.content[:500]
+                if len(ref_msg.content) > 500:
+                    ref_text += "..."
+                reply_context = f"[Replying to {ref_author}: \"{ref_text}\"]\n\n"
+            except Exception as e:
+                logger.warning(f"Failed to resolve reply reference: {e}")
+
+        user_input = reply_context + message.content
+
+        # If this message was bundled with earlier queued messages, prepend them
+        bundled_prefix = self._bundled_prefixes.pop(message.id, None)
+        if bundled_prefix:
+            user_input = f"[Earlier messages sent while you were working:]\n{bundled_prefix}\n\n[Latest message:]\n{user_input}"
+
+        on_thinking = self.make_on_thinking(thread)
+
+        async def on_conv_id(cid: str):
+            if cid != conv_id:
+                await update_conversation_id(thread_id, cid)
+            if thread_id in self._inflight:
+                self._inflight[thread_id]["conv_id"] = cid
+
+        task = asyncio.current_task()
+        self._inflight[thread_id] = {"conv_id": conv_id or "", "task": task}
+
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
+        try:
+            result = await self.zo.ask_stream(
+                user_input,
+                conversation_id=conv_id if conv_id else None,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+            )
+            response, new_conv_id = result.output, result.conv_id
+
+            if new_conv_id != conv_id:
+                await update_conversation_id(thread_id, new_conv_id)
+                if not conv_id:
+                    logger.info(f"Started new conversation {new_conv_id} for notification thread")
+                else:
+                    logger.info(f"Conversation ID changed from {conv_id} to {new_conv_id}")
+
+            await update_activity(thread_id)
+
+            if not response or not response.strip():
+                logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted})")
+                response, new_conv_id = await self._retry_empty_response(
+                    thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
+                    interrupted=result.interrupted,
+                )
+
+            chunks = self.zo.chunk_response(response)
+            chunks = [c for c in chunks if c.strip()]
+            if not chunks:
+                # All retries exhausted — show fallback
+                logger.error(f"All retries exhausted for thread {thread.id}")
+                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id or conv_id}`\n\nSend another message to try again."]
+            for i, chunk in enumerate(chunks):
+                kwargs = {"content": chunk}
+                if i == 0:
+                    ref = discord.MessageReference(
+                        message_id=message.id,
+                        channel_id=message.channel.id,
+                        fail_if_not_exists=False,
+                    )
+                    kwargs["reference"] = ref
+                    kwargs["mention_author"] = False
+                    logger.info(f"Replying to message {message.id} in thread {thread.id}")
+                await send_suppressed(thread, **kwargs)
+
+        except asyncio.CancelledError:
+            logger.info(f"Thread {thread_id} request was cancelled")
+        except Exception as e:
+            logger.error(f"Error in thread: {e}", exc_info=True)
+            # Try to recover the response from conversation history.
+            # The Zo agent may have responded, but the Discord connection
+            # dropped before we could relay it (e.g. "Connection closed").
+            recovery_conv_id = (self._inflight.get(thread_id, {}).get("conv_id") or conv_id)
+            recovered = False
+            if recovery_conv_id:
+                try:
+                    logger.info(f"Attempting response recovery for conv {recovery_conv_id}")
+                    # Wait for Discord websocket to reconnect before trying to post
+                    for wait_secs in [5, 10, 15, 15, 15]:
+                        if not self.is_closed() and self.ws and self.ws.open:
+                            break
+                        logger.info(f"Waiting {wait_secs}s for Discord reconnect...")
+                        await asyncio.sleep(wait_secs)
+                    idle_result = await self.zo.wait_for_idle(recovery_conv_id, max_wait=60)
+                    if idle_result and idle_result.output and idle_result.output.strip():
+                        logger.info(f"Recovered {len(idle_result.output)} chars from conv {recovery_conv_id}")
+                        chunks = self.zo.chunk_response(idle_result.output)
+                        chunks = [c for c in chunks if c.strip()]
+                        for i, chunk in enumerate(chunks):
+                            kwargs = {"content": chunk}
+                            if i == 0:
+                                ref = discord.MessageReference(
+                                    message_id=message.id,
+                                    channel_id=message.channel.id,
+                                    fail_if_not_exists=False,
+                                )
+                                kwargs["reference"] = ref
+                                kwargs["mention_author"] = False
+                            await send_suppressed(thread, **kwargs)
+                        recovered = True
+                except Exception as recovery_err:
+                    logger.error(f"Recovery failed for conv {recovery_conv_id}: {recovery_err}")
+            if not recovered:
+                error_msg = str(e)
+                conv_label = f"\nConversation: `{recovery_conv_id}`" if recovery_conv_id else ""
+                full_error = f"\u274c **Error:** {error_msg}{conv_label}"
+                try:
+                    for chunk in self.zo.chunk_response(full_error):
+                        await send_suppressed(thread, content=chunk)
+                except Exception:
+                    pass  # Discord may still be disconnected
+                await self.set_status(thread, "error")
+        finally:
+            self._inflight.pop(thread_id, None)
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
+            await self._drain_queue(thread_id)
+
+    def _collect_queued_text(self, thread_id: str) -> list[str]:
+        """Consume all queued messages for a thread, returning their text.
+
+        Returns a list of "[Author]: content" strings. The queue is emptied
+        so these messages won't be double-processed by _drain_queue.
+        """
+        queue = self._message_queues.get(thread_id)
+        if not queue or queue.empty():
+            return []
+
+        parts = []
+        while not queue.empty():
+            try:
+                msg = queue.get_nowait()
+                parts.append(f"[{msg.author.display_name}]: {msg.content}")
+            except asyncio.QueueEmpty:
+                break
+        self._message_queues.pop(thread_id, None)
+        return parts
+
+    async def _retry_empty_response(
+        self,
+        thread_id: str,
+        conv_id: str,
+        thread: discord.Thread,
+        on_thinking,
+        on_conv_id,
+        interrupted: bool = False,
+    ) -> tuple[str, str]:
+        """Recover from an empty response using a two-phase strategy.
+
+        Phase 1 (interrupted stream): The agent may still be working. Poll with
+        wait_for_idle — if the API returns 409, the agent is busy and we just
+        wait patiently. This avoids sending "please continue" which would
+        interrupt a working agent. wait_for_idle sends a "please continue"
+        probe only after the 409s stop, so we may get a real response back.
+
+        Phase 2 (confirmed idle, still empty): The agent genuinely finished
+        with no output. Send "please continue" (bundling any queued user
+        messages) via streaming to get a real response.
+        """
+        # Phase 1: If the stream was interrupted, wait for the agent to finish
+        if interrupted:
+            logger.info(f"Stream was interrupted for conv {conv_id}, waiting for agent to finish")
+            idle_result = await self.zo.wait_for_idle(conv_id)
+
+            if idle_result is not None:
+                if idle_result.conv_id != conv_id:
+                    await update_conversation_id(thread_id, idle_result.conv_id)
+                    conv_id = idle_result.conv_id
+
+                if idle_result.output and idle_result.output.strip():
+                    logger.info(f"Got response from wait_for_idle for conv {conv_id}")
+                    return idle_result.output, conv_id
+
+                logger.info(f"Agent is idle but output still empty for conv {conv_id}, proceeding to phase 2")
+            else:
+                logger.error(f"Timed out waiting for conv {conv_id} to become idle")
+                return "", conv_id
+
+        # Phase 2: Agent is idle but produced no output. Send "please continue"
+        # with any queued user messages.
+        queued_parts = self._collect_queued_text(thread_id)
+        if queued_parts:
+            retry_input = " ".join(queued_parts)
+            logger.info(f"Sending continue with {len(queued_parts)} queued message(s) for conv {conv_id}")
+        else:
+            retry_input = "Please continue."
+
+        retry_delays = [15, 30, 60]
+        for attempt, delay in enumerate(retry_delays, 1):
+            logger.warning(f"Empty response (conv {conv_id}), continue attempt {attempt}/{len(retry_delays)} in {delay}s")
+            await asyncio.sleep(delay)
+
+            try:
+                result = await self.zo.send_continue(
+                    retry_input,
+                    conversation_id=conv_id,
+                    on_thinking=on_thinking,
+                    on_conv_id=on_conv_id,
+                )
+                if result.conv_id != conv_id:
+                    await update_conversation_id(thread_id, result.conv_id)
+                    conv_id = result.conv_id
+
+                if result.output and result.output.strip():
+                    logger.info(f"Continue attempt {attempt} succeeded for conv {conv_id}")
+                    return result.output, conv_id
+
+                if result.interrupted:
+                    logger.info(f"Continue attempt {attempt} was also interrupted, waiting for idle")
+                    idle_result = await self.zo.wait_for_idle(conv_id)
+                    if idle_result and idle_result.output and idle_result.output.strip():
+                        if idle_result.conv_id != conv_id:
+                            await update_conversation_id(thread_id, idle_result.conv_id)
+                        return idle_result.output, idle_result.conv_id
+            except Exception as e:
+                logger.error(f"Continue attempt {attempt} failed for conv {conv_id}: {e}")
+
+        logger.error(f"All retries exhausted for conv {conv_id}")
+        return "", conv_id
+
+    async def _drain_queue(self, thread_id: str):
+        """Drain queued messages for a thread, bundling them into one turn.
+
+        The agent sees all queued messages and decides how to interpret them
+        (e.g. "do X" then "no actually Y" → agent does Y;
+        "do X" then "also Y" → agent does X+Y).
+        """
+        try:
+            queue = self._message_queues.get(thread_id)
+            if not queue or queue.empty():
+                return
+
+            queued_msgs = []
+            while not queue.empty():
+                queued_msgs.append(await queue.get())
+            self._message_queues.pop(thread_id, None)
+
+            if len(queued_msgs) == 1:
+                logger.info(f"Processing 1 queued message from {queued_msgs[0].author} in thread {thread_id}")
+                await self.handle_thread_message(queued_msgs[0])
+            else:
+                logger.info(f"Processing {len(queued_msgs)} bundled queued messages in thread {thread_id}")
+                # Use the last message as the "primary" (for attachments, reply context, etc.)
+                # and prepend the earlier messages as context
+                primary = queued_msgs[-1]
+                earlier_parts = []
+                for msg in queued_msgs[:-1]:
+                    earlier_parts.append(f"[{msg.author.display_name}]: {msg.content}")
+                bundle_prefix = "\n".join(earlier_parts)
+                self._bundled_prefixes[primary.id] = bundle_prefix
+                await self.handle_thread_message(primary)
+        except Exception as e:
+            logger.error(f"Error draining message queue for thread {thread_id}: {e}", exc_info=True)
+
+    async def build_channel_context(self, channel: discord.TextChannel, include_source: bool = True, thread: discord.Thread = None) -> tuple[str, list[str]]:
+        """Build context string and file paths for the /zo/ask endpoint.
+
+        Returns:
+            (context, file_paths) — context is appended after the user message,
+            file_paths lists paths Zo should read.
+        """
+        sections = []
+        file_paths = []
+        ch_config = await get_channel_config(str(channel.id))
+
+        # Always include channel folder
+        channel_dir = get_channel_dir(channel.name)
+        channel_dir_str = str(channel_dir)
+        file_paths.append(channel_dir_str)
+
+        if include_source:
+            # === FIRST MESSAGE: full context ===
+
+            sections.append(
+                "## Message Source\n"
+                "This message is from Discord (channel: #" + channel.name + "). "
+                "Reply normally \u2014 your response will appear in the thread. "
+                "Do not use the Discord API to send your reply."
+            )
+
+            sections.append(
+                "## Channel Workspace\n"
+                "This channel's workspace folder is: `" + channel_dir_str + "`\n"
+                "- **Start of conversation**: Read this folder for any relevant context, notes, or files from previous conversations.\n"
+                "- **Memory requests**: If the user asks you to remember something, save a file, or add notes for this channel, "
+                "write them to this folder (e.g. `" + channel_dir_str + "/notes.md`).\n"
+                "- **Attachments**: User-uploaded files are saved to `" + channel_dir_str + "/attachments/`."
+            )
+
+            if ch_config:
+                if ch_config.get("instructions"):
+                    sections.append("## Channel Instructions\n" + ch_config["instructions"])
+                if ch_config.get("memory_paths"):
+                    for mp in ch_config["memory_paths"]:
+                        file_paths.append("/home/workspace/" + mp)
+
+            if channel.topic and not (ch_config and ch_config.get("instructions")):
+                sections.append("## Channel Topic\n" + channel.topic)
+
+            try:
+                pins = await channel.pins()
+                if pins:
+                    pin_texts = []
+                    for pin in reversed(pins):
+                        content = pin.content[:500] if pin.content else "[attachment/embed]"
+                        pin_texts.append("- **" + pin.author.display_name + "**: " + content)
+                    sections.append("## Pinned Context\n" + "\n".join(pin_texts))
+            except discord.Forbidden:
+                pass
+
+            if not thread:
+                sections.append(
+                    "## Thread Naming\n"
+                    "Name this thread: `zo-discord rename \"Descriptive Title\"`\n"
+                    "3-6 words, max 50 chars. Be specific and scannable. Do this before responding."
+                )
+            elif thread:
+                clean_name = strip_status_prefix(thread.name)
+                sections.append(
+                    "## Thread Info\n"
+                    "- **Current Name**: " + clean_name + "\n\n"
+                    "Rename this thread based on the conversation topic (3-6 words, max 50 chars, silently):\n"
+                    '`zo-discord rename "New title"`'
+                )
+
+            sections.append(
+                "## Discord Tools\n"
+                "CLI: `zo-discord <command>` (thread auto-detected)\n"
+                'Spawn a new thread: `zo-discord new-thread "Title" "context/prompt"`\n'
+                'Ask user to choose? Use buttons: `zo-discord buttons "Question?" "Option A:primary" "Option B:secondary"`\n'
+                "Full Discord API docs: `Skills/zo-discord/SKILL.md`"
+            )
+
+        else:
+            # === FOLLOW-UP MESSAGE: compact context ===
+            if thread:
+                clean_name = strip_status_prefix(thread.name)
+                sections.append(
+                    "## Thread Info\n"
+                    "- **Current Name**: " + clean_name + "\n"
+                    "- **Channel workspace**: `" + channel_dir_str + "`\n\n"
+                    "You are in a Discord thread. Reply normally \u2014 do not use the Discord API to send your reply.\n"
+                    'Rename if topic shifted: `zo-discord rename "New title"`\n'
+                    'Spawn a new thread: `zo-discord new-thread "Title" "context/prompt"`\n'
+                    'Ask user to choose? Use buttons: `zo-discord buttons "Question?" "Option A:primary" "Option B:secondary"`\n'
+                    "Full Discord API docs: `Skills/zo-discord/SKILL.md`"
+                )
+
+        return "\n\n".join(sections), file_paths
+
+    async def build_thread_context(self, thread: discord.Thread, include_source: bool = False) -> tuple[str, list[str]]:
+        """Build context string and file paths for a thread message.
+
+        Returns:
+            (context, file_paths) — merged with parent channel context.
+        """
+        sections = []
+        file_paths = []
+
+        if thread.parent:
+            parent_ctx, parent_paths = await self.build_channel_context(
+                thread.parent, include_source=include_source, thread=thread
+            )
+            if parent_ctx:
+                sections.append(parent_ctx)
+            file_paths.extend(parent_paths)
+
+        try:
+            pins = await thread.pins()
+            if pins:
+                pin_texts = []
+                for pin in reversed(pins):
+                    content = pin.content[:500] if pin.content else "[attachment/embed]"
+                    pin_texts.append(f"- **{pin.author.display_name}**: {content}")
+                sections.append("## Thread Pins\n" + "\n".join(pin_texts))
+        except discord.Forbidden:
+            pass
+
+        return "\n\n".join(sections), file_paths
+
+    def make_on_thinking(self, channel):
+        """Create an on_thinking callback that respects the thinking mode setting."""
+        async def on_thinking(text: str):
+            if self._thinking_mode == "streaming":
+                await send_suppressed(channel, content=f"*{text}*")
+        return on_thinking
+
+    async def typing_loop(self, channel, stop_event: asyncio.Event):
+        while not stop_event.is_set():
+            try:
+                await channel.trigger_typing()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+
+    # ─── HTTP Server ──────────────────────────────────────────────────────
+
+    async def start_http_server(self):
+        self.http_app = web.Application()
+        self.http_app.router.add_post("/notify", self.handle_notify)
+        self.http_app.router.add_get("/threads", self.handle_list_threads)
+        self.http_app.router.add_post("/threads/{thread_id}/rename", self.handle_rename_thread)
+        self.http_app.router.add_get("/health", self.handle_health)
+        # New endpoints
+        self.http_app.router.add_post("/buttons", self.handle_buttons)
+        self.http_app.router.add_post("/files", self.handle_files)
+        self.http_app.router.add_post("/embeds", self.handle_embeds)
+        self.http_app.router.add_post("/react", self.handle_react)
+        self.http_app.router.add_post("/messages/edit", self.handle_edit_message)
+        self.http_app.router.add_delete("/messages", self.handle_delete_message)
+        self.http_app.router.add_post("/messages/send", self.handle_send_message)
+        self.http_app.router.add_post("/conversations/{conv_id}/buttons", self.handle_conversation_buttons)
+        self.http_app.router.add_get("/channels/{channel_id}/config", self.handle_get_channel_config)
+        self.http_app.router.add_post("/channels/{channel_id}/config", self.handle_set_channel_config)
+        self.http_app.router.add_delete("/channels/{channel_id}/config", self.handle_delete_channel_config)
+        self.http_app.router.add_post("/threads/{thread_id}/status", self.handle_set_status)
+        self.http_app.router.add_post("/conversations/{conv_id}/action", self.handle_conversation_action)
+        self.http_app.router.add_post("/conversations/{conv_id}/new-thread", self.handle_new_thread)
+
+        port = self.config.get("notification_port", 8787)
+
+        self.http_runner = web.AppRunner(self.http_app)
+        await self.http_runner.setup()
+
+        site = web.TCPSite(self.http_runner, "0.0.0.0", port)
+        await site.start()
+
+        logger.info(f"HTTP server started on port {port}")
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response({
+            "status": "ok",
+            "bot_user": str(self.user) if self.user else None,
+            "guilds": len(self.guilds)
+        })
+
+    def resolve_channel_by_name(self, name: str):
+        """Resolve a channel name to a discord.TextChannel using the bot's guild cache."""
+        for guild in self.guilds:
+            for ch in guild.text_channels:
+                if ch.name == name:
+                    return ch
+        return None
+
+    async def handle_notify(self, request: web.Request) -> web.Response:
+        """Create a notification thread in a channel.
+
+        POST /notify
+        {
+            "channel_id": "123" | "channel_name": "pulse",
+            "title": "Thread Title",
+            "content": "Message body",
+            "conversation_id": "con_xxx"
+        }
+        """
+        try:
+            data = await request.json()
+            channel_id = data.get("channel_id")
+            channel_name = data.get("channel_name")
+            title = data.get("title", "Notification")[:100]
+            content = data.get("content", "")
+            conversation_id = data.get("conversation_id", "")
+
+            if channel_name and not channel_id:
+                channel = self.resolve_channel_by_name(channel_name)
+                if not channel:
+                    return web.json_response({"error": f"No channel found with name '{channel_name}'"}, status=404)
+            elif channel_id:
+                channel = self.get_channel(int(channel_id))
+                if not channel:
+                    return web.json_response({"error": "Channel not found"}, status=404)
+            else:
+                return web.json_response({"error": "channel_id or channel_name is required"}, status=400)
+
+            # Starter message: title + mention (creates the thread, one notification)
+            starter_parts = [f"**{title}**"]
+            allowed_users = self.config.get("allowed_users", [])
+            if allowed_users:
+                mentions = " ".join(f"<@{uid}>" for uid in allowed_users)
+                starter_parts.append(mentions)
+            msg = await channel.send(" ".join(starter_parts))
+            thread = await msg.create_thread(
+                name=title,
+            )
+
+            await save_mapping(
+                thread_id=str(thread.id),
+                conversation_id=conversation_id,
+                channel_id=str(channel.id),
+                guild_id=str(channel.guild.id),
+                thread_name=title
+            )
+
+            # Body goes inside the thread (reactable for dismiss)
+            if content:
+                chunks = self.zo.chunk_response(content)
+                for chunk in chunks:
+                    await send_suppressed(thread, content=chunk)
+
+            logger.info(f"Notification thread '{title}' created (id: {thread.id})")
+
+            return web.json_response({
+                "success": True,
+                "thread_id": str(thread.id),
+                "conversation_id": conversation_id
+            })
+
+        except Exception as e:
+            logger.error(f"Notify error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_list_threads(self, request: web.Request) -> web.Response:
+        limit = int(request.query.get("limit", 50))
+        guild_id = request.query.get("guild_id")
+
+        threads = await get_active_threads(guild_id, limit)
+
+        result = []
+        for t in threads:
+            thread_data = {
+                "thread_id": t["thread_id"],
+                "conversation_id": t["conversation_id"],
+                "channel_id": t["channel_id"],
+                "current_name": t["thread_name"],
+                "last_activity": t["last_activity"],
+                "recent_messages": []
+            }
+
+            try:
+                thread = self.get_channel(int(t["thread_id"]))
+                if thread:
+                    messages = []
+                    async for msg in thread.history(limit=10):
+                        messages.append({
+                            "author": msg.author.display_name,
+                            "content": msg.content[:200],
+                            "is_bot": msg.author.bot
+                        })
+                    thread_data["recent_messages"] = list(reversed(messages))
+            except Exception:
+                pass
+
+            result.append(thread_data)
+
+        return web.json_response(result)
+
+    async def handle_rename_thread(self, request: web.Request) -> web.Response:
+        thread_id = request.match_info["thread_id"]
+
+        try:
+            data = await request.json()
+            new_name = data["name"][:100]
+
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+            # Preserve current status prefix
+            current_status = await get_thread_status(thread_id)
+            display_name = set_thread_status_prefix(new_name, current_status)
+
+            try:
+                await asyncio.wait_for(thread.edit(name=display_name), timeout=10.0)
+            except (asyncio.TimeoutError, discord.HTTPException) as e:
+                logger.warning(f"Rename Discord API call failed ({e}), saving to DB only")
+            await update_thread_name(thread_id, display_name)
+
+            return web.json_response({"success": True, "name": display_name})
+
+        except Exception as e:
+            logger.error(f"Rename error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_buttons(self, request: web.Request) -> web.Response:
+        """Send interactive buttons to a thread.
+
+        POST /buttons
+        {
+            "thread_id": "123",
+            "prompt": "Do you approve?",
+            "buttons": [{"label": "Yes", "id": "yes", "style": "success"}, ...],
+            "preset": "approve_reject"  // optional, overrides buttons
+        }
+        """
+        try:
+            data = await request.json()
+            thread_id = data["thread_id"]
+            prompt = data.get("prompt", "Choose an option:")
+
+            presets = {
+                "approve_reject": [
+                    {"label": "Approve", "id": "approve", "style": "success"},
+                    {"label": "Reject", "id": "reject", "style": "danger"},
+                ],
+                "yes_no": [
+                    {"label": "Yes", "id": "yes", "style": "success"},
+                    {"label": "No", "id": "no", "style": "danger"},
+                ],
+            }
+
+            buttons = data.get("buttons") or presets.get(data.get("preset"), [])
+            if not buttons:
+                return web.json_response({"error": "No buttons specified"}, status=400)
+
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+            view = ButtonCallbackView(self, thread_id, buttons)
+            msg = await thread.send(prompt, view=view)
+
+            return web.json_response({
+                "success": True,
+                "message_id": str(msg.id)
+            })
+
+        except Exception as e:
+            logger.error(f"Buttons error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_files(self, request: web.Request) -> web.Response:
+        """Send a file attachment to a thread.
+
+        POST /files
+        {
+            "thread_id": "123",
+            "file_path": "/home/workspace/report.pdf",
+            "message": "Here's the report"
+        }
+        """
+        try:
+            data = await request.json()
+            thread_id = data["thread_id"]
+            file_path = Path(data["file_path"])
+            message = data.get("message", "")
+
+            if not file_path.exists():
+                return web.json_response({"error": f"File not found: {file_path}"}, status=404)
+
+            if file_path.stat().st_size > 25 * 1024 * 1024:
+                return web.json_response({"error": "File too large (max 25MB)"}, status=400)
+
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+            msg = await thread.send(
+                content=message or None,
+                file=discord.File(str(file_path))
+            )
+
+            return web.json_response({
+                "success": True,
+                "message_id": str(msg.id)
+            })
+
+        except Exception as e:
+            logger.error(f"File send error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_embeds(self, request: web.Request) -> web.Response:
+        """Send a rich embed to a thread.
+
+        POST /embeds
+        {
+            "thread_id": "123",
+            "title": "Report",
+            "description": "Summary...",
+            "color": "blue",
+            "fields": [{"name": "Key", "value": "Value", "inline": true}],
+            "footer": "Optional footer text"
+        }
+        """
+        try:
+            data = await request.json()
+            thread_id = data["thread_id"]
+
+            colors = {
+                "blue": 0x3498db,
+                "green": 0x2ecc71,
+                "red": 0xe74c3c,
+                "yellow": 0xf1c40f,
+                "purple": 0x9b59b6,
+                "orange": 0xe67e22,
+                "gray": 0x95a5a6,
+            }
+            color = colors.get(data.get("color", "blue"), 0x3498db)
+
+            embed = discord.Embed(
+                title=data.get("title"),
+                description=data.get("description"),
+                color=color
+            )
+
+            for field in data.get("fields", []):
+                embed.add_field(
+                    name=field["name"],
+                    value=field["value"],
+                    inline=field.get("inline", False)
+                )
+
+            if data.get("footer"):
+                embed.set_footer(text=data["footer"])
+
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+            msg = await thread.send(embed=embed)
+
+            return web.json_response({
+                "success": True,
+                "message_id": str(msg.id)
+            })
+
+        except Exception as e:
+            logger.error(f"Embed error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_react(self, request: web.Request) -> web.Response:
+        """Add a reaction to a message.
+
+        POST /react
+        {"channel_id": "123", "message_id": "456", "emoji": "\u2705"}
+        """
+        try:
+            data = await request.json()
+            channel = self.get_channel(int(data["channel_id"]))
+            if not channel:
+                return web.json_response({"error": "Channel not found"}, status=404)
+
+            message = await channel.fetch_message(int(data["message_id"]))
+            await message.add_reaction(data["emoji"])
+
+            return web.json_response({"success": True})
+
+        except Exception as e:
+            logger.error(f"React error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_edit_message(self, request: web.Request) -> web.Response:
+        """Edit a bot message.
+
+        POST /messages/edit
+        {"channel_id": "123", "message_id": "456", "content": "New content"}
+        """
+        try:
+            data = await request.json()
+            channel = self.get_channel(int(data["channel_id"]))
+            if not channel:
+                return web.json_response({"error": "Channel not found"}, status=404)
+
+            message = await channel.fetch_message(int(data["message_id"]))
+            if message.author.id != self.user.id:
+                return web.json_response({"error": "Can only edit own messages"}, status=403)
+
+            await message.edit(content=data["content"])
+
+            return web.json_response({"success": True})
+
+        except Exception as e:
+            logger.error(f"Edit error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_delete_message(self, request: web.Request) -> web.Response:
+        """Delete a bot message.
+
+        DELETE /messages
+        {"channel_id": "123", "message_id": "456"}
+        """
+        try:
+            data = await request.json()
+            channel = self.get_channel(int(data["channel_id"]))
+            if not channel:
+                return web.json_response({"error": "Channel not found"}, status=404)
+
+            message = await channel.fetch_message(int(data["message_id"]))
+            if message.author.id != self.user.id:
+                return web.json_response({"error": "Can only delete own messages"}, status=403)
+
+            await message.delete()
+
+            return web.json_response({"success": True})
+
+        except Exception as e:
+            logger.error(f"Delete error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_send_message(self, request: web.Request) -> web.Response:
+        """Send a message to a channel or thread.
+
+        POST /messages/send
+        {"channel_id": "123", "content": "Hello"}
+        """
+        try:
+            data = await request.json()
+            channel = self.get_channel(int(data["channel_id"]))
+            if not channel:
+                return web.json_response({"error": "Channel not found"}, status=404)
+
+            chunks = self.zo.chunk_response(data["content"])
+            msg = None
+            for chunk in chunks:
+                msg = await send_suppressed(channel, content=chunk)
+
+            return web.json_response({
+                "success": True,
+                "message_id": str(msg.id) if msg else None
+            })
+
+        except Exception as e:
+            logger.error(f"Send error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_set_status(self, request: web.Request) -> web.Response:
+        """Set thread status.
+
+        POST /threads/{thread_id}/status
+        {"status": "working|review|error|complete"}
+        """
+        thread_id = request.match_info["thread_id"]
+        try:
+            data = await request.json()
+            status = data.get("status")
+            if status == "complete":
+                try:
+                    thread = self.get_channel(int(thread_id))
+                    if thread:
+                        await set_watched(thread_id, False)
+                        await thread.edit(archived=True)
+                except Exception as e:
+                    logger.error(f"Failed to archive: {e}")
+                return web.json_response({"success": True, "status": status})
+
+            if status not in STATUS_EMOJI:
+                return web.json_response({"error": f"Invalid status. Valid: {list(STATUS_EMOJI.keys()) + ['complete']}"}, status=400)
+
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found in Discord"}, status=404)
+
+            await self.set_status(thread, status)
+
+            if status == "complete":
+                await set_watched(str(thread.id), False)
+                await thread.edit(archived=True)
+
+            return web.json_response({"success": True, "status": status})
+
+        except Exception as e:
+            logger.error(f"Status error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_conversation_action(self, request: web.Request) -> web.Response:
+        """Perform a thread action using conversation ID instead of thread ID.
+
+        POST /conversations/{conv_id}/action
+        {"action": "rename", "name": "New title"}
+        {"action": "error|complete"}
+        {"action": "send", "content": "message"}
+        """
+        conv_id = request.match_info["conv_id"]
+        try:
+            data = await request.json()
+            action = data.get("action")
+
+            # Rename handles its own mapping check (queues for unmapped conv_ids)
+            if action == "rename":
+                name = data.get("name", "")[:100]
+                mapping = await get_mapping_by_conversation(conv_id)
+                if not mapping:
+                    self.queued_renames[conv_id] = name
+                    logger.info(f"Queued rename '{name}' for conv {conv_id}")
+                    return web.json_response({"success": True, "queued": True, "name": name})
+                thread_id = mapping["thread_id"]
+                thread = self.get_channel(int(thread_id))
+                if not thread:
+                    return web.json_response({"error": "Thread not found in Discord"}, status=404)
+                current_status = await get_thread_status(thread_id)
+                display_name = set_thread_status_prefix(name, current_status)
+                try:
+                    await asyncio.wait_for(thread.edit(name=display_name), timeout=10.0)
+                except (asyncio.TimeoutError, discord.HTTPException) as e:
+                    logger.warning(f"Rename Discord API call failed ({e}), saving to DB only")
+                await update_thread_name(thread_id, display_name)
+                return web.json_response({"success": True, "name": display_name})
+
+            # All other actions require an existing mapping
+            mapping = await get_mapping_by_conversation(conv_id)
+            if not mapping:
+                return web.json_response({"error": f"No thread found for conversation {conv_id}"}, status=404)
+
+            thread_id = mapping["thread_id"]
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found in Discord"}, status=404)
+
+            if action == "complete":
+                try:
+                    await set_watched(thread_id, False)
+                    await thread.edit(archived=True)
+                except Exception as e:
+                    logger.error(f"Failed to archive: {e}")
+                return web.json_response({"success": True, "status": action})
+
+            elif action in STATUS_EMOJI:
+                await self.set_status(thread, action)
+                return web.json_response({"success": True, "status": action})
+
+            elif action == "send":
+                content = data.get("content", "")
+                if not content:
+                    return web.json_response({"error": "content required"}, status=400)
+                chunks = self.zo.chunk_response(content)
+                msg = None
+                for chunk in chunks:
+                    msg = await send_suppressed(thread, content=chunk)
+                return web.json_response({"success": True, "message_id": str(msg.id)})
+
+            else:
+                return web.json_response({"error": f"Unknown action: {action}. Valid: rename, send, {', '.join(STATUS_EMOJI.keys())}"}, status=400)
+
+        except Exception as e:
+            logger.error(f"Conversation action error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_new_thread(self, request: web.Request) -> web.Response:
+        """Spawn a new Discord thread with a fresh Zo session.
+
+        POST /conversations/{conv_id}/new-thread
+        {
+            "title": "Thread Title",
+            "prompt": "Context or question for the new thread",
+            "channel_id": "optional — defaults to current thread's channel",
+            "channel_name": "optional — resolve by name instead of ID"
+        }
+        """
+        conv_id = request.match_info["conv_id"]
+        try:
+            data = await request.json()
+            title = data.get("title", "New Thread")[:100]
+            prompt = data.get("prompt", "")
+            target_channel_id = data.get("channel_id")
+            target_channel_name = data.get("channel_name")
+
+            if not prompt:
+                return web.json_response({"error": "prompt is required"}, status=400)
+
+            if target_channel_name and not target_channel_id:
+                channel = self.resolve_channel_by_name(target_channel_name)
+                if not channel:
+                    return web.json_response({"error": f"No channel found with name '{target_channel_name}'"}, status=404)
+            elif target_channel_id:
+                channel = self.get_channel(int(target_channel_id))
+            else:
+                mapping = await get_mapping_by_conversation(conv_id)
+                if mapping:
+                    channel = self.get_channel(int(mapping["channel_id"]))
+                else:
+                    return web.json_response({"error": "No thread found for conversation and no channel_id/channel_name provided"}, status=400)
+
+            if not channel:
+                return web.json_response({"error": "Channel not found"}, status=404)
+
+            # Combine title + mention into single starter message
+            starter_parts = [title]
+            allowed_users = self.config.get("allowed_users", [])
+            if allowed_users:
+                mentions = " ".join(f"<@{uid}>" for uid in allowed_users)
+                starter_parts.append(mentions)
+            msg = await channel.send("\n".join(starter_parts))
+            thread = await msg.create_thread(
+                name=title,
+            )
+
+            await save_mapping(
+                thread_id=str(thread.id),
+                conversation_id="",
+                channel_id=str(channel.id),
+                guild_id=str(channel.guild.id),
+                thread_name=title
+            )
+
+            context, file_paths = await self.build_channel_context(channel, include_source=True, thread=thread)
+
+            thread_id_str = str(thread.id)
+
+            on_thinking = self.make_on_thinking(thread)
+
+            async def on_conv_id(cid: str):
+                await update_conversation_id(thread_id_str, cid)
+
+            result = await self.zo.ask_stream(
+                prompt,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+            )
+            response, new_conv_id = result.output, result.conv_id
+
+            if not response or not response.strip():
+                logger.warning(f"Empty response for new thread {thread.id} (interrupted={result.interrupted})")
+                response, new_conv_id = await self._retry_empty_response(
+                    thread_id_str, new_conv_id, thread, on_thinking, on_conv_id,
+                    interrupted=result.interrupted,
+                )
+
+            chunks = self.zo.chunk_response(response)
+            chunks = [c for c in chunks if c.strip()]
+            if not chunks:
+                logger.error(f"All retries exhausted for new thread {thread.id}")
+                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id}`\n\nSend another message to try again."]
+            for chunk in chunks:
+                await send_suppressed(thread, content=chunk)
+
+            logger.info(f"Created new thread '{title}' (id: {thread.id}) with conv {new_conv_id}")
+
+            return web.json_response({
+                "success": True,
+                "thread_id": str(thread.id),
+                "conversation_id": new_conv_id
+            })
+
+        except Exception as e:
+            logger.error(f"New thread error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_conversation_buttons(self, request: web.Request) -> web.Response:
+        """Send interactive buttons to a thread using conversation ID.
+
+        POST /conversations/{conv_id}/buttons
+        {
+            "prompt": "Do you approve?",
+            "buttons": [{"label": "Yes", "id": "yes", "style": "success"}, ...],
+            "preset": "approve_reject"  // optional, overrides buttons
+        }
+        """
+        conv_id = request.match_info["conv_id"]
+        try:
+            data = await request.json()
+
+            mapping = await get_mapping_by_conversation(conv_id)
+            if not mapping:
+                return web.json_response({"error": f"No thread found for conversation {conv_id}"}, status=404)
+
+            thread_id = mapping["thread_id"]
+            data["thread_id"] = thread_id
+            # Delegate to existing handler by constructing a modified request
+            prompt = data.get("prompt", "Choose an option:")
+
+            presets = {
+                "approve_reject": [
+                    {"label": "Approve", "id": "approve", "style": "success"},
+                    {"label": "Reject", "id": "reject", "style": "danger"},
+                ],
+                "yes_no": [
+                    {"label": "Yes", "id": "yes", "style": "success"},
+                    {"label": "No", "id": "no", "style": "danger"},
+                ],
+            }
+
+            buttons = data.get("buttons") or presets.get(data.get("preset"), [])
+            if not buttons:
+                return web.json_response({"error": "No buttons specified"}, status=400)
+
+            thread = self.get_channel(int(thread_id))
+            if not thread:
+                return web.json_response({"error": "Thread not found"}, status=404)
+
+            view = ButtonCallbackView(self, thread_id, buttons)
+            msg = await thread.send(prompt, view=view)
+
+            return web.json_response({
+                "success": True,
+                "message_id": str(msg.id)
+            })
+
+        except Exception as e:
+            logger.error(f"Conversation buttons error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_get_channel_config(self, request: web.Request) -> web.Response:
+        channel_id = request.match_info["channel_id"]
+        config = await get_channel_config(channel_id)
+        if not config:
+            return web.json_response({"error": "No config for this channel"}, status=404)
+        return web.json_response(config)
+
+    async def handle_set_channel_config(self, request: web.Request) -> web.Response:
+        channel_id = request.match_info["channel_id"]
+        try:
+            data = await request.json()
+            await set_channel_config(channel_id, **data)
+            config = await get_channel_config(channel_id)
+            return web.json_response({"success": True, "config": config})
+        except Exception as e:
+            logger.error(f"Set channel config error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_delete_channel_config(self, request: web.Request) -> web.Response:
+        channel_id = request.match_info["channel_id"]
+        try:
+            await delete_channel_config(channel_id)
+            return web.json_response({"success": True})
+        except Exception as e:
+            logger.error(f"Delete channel config error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def close(self):
+        if self.http_runner:
+            await self.http_runner.cleanup()
+        await super().close()
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Discord-Zo Bridge Bot")
+    parser.add_argument("--status", action="store_true", help="Check bot status")
+    args = parser.parse_args()
+
+    if args.status:
+        token = os.environ.get("DISCORD_BOT_TOKEN")
+        api_key = os.environ.get("DISCORD_ZO_API_KEY")
+
+        print("Discord-Zo Bot Status")
+        print("=" * 40)
+        token_status = "\u2713 Set" if token else "\u2717 Not set"
+        key_status = "\u2713 Set" if api_key else "\u2717 Not set"
+        print(f"DISCORD_BOT_TOKEN: {token_status}")
+        print(f"DISCORD_ZO_API_KEY: {key_status}")
+        print(f"Config: {Path(__file__).parent / 'config' / 'config.json'}")
+
+        if not token or not api_key:
+            print("\nAdd missing secrets at: Settings > Developers")
+            sys.exit(1)
+
+        sys.exit(0)
+
+    token = os.environ.get("DISCORD_BOT_TOKEN")
+    if not token:
+        logger.error("DISCORD_BOT_TOKEN not set. Add it in Settings > Developers")
+        sys.exit(1)
+
+    bot = ZoDiscordBot()
+    bot.run(token)
+
+
+if __name__ == "__main__":
+    main()
