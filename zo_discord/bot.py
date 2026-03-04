@@ -404,6 +404,9 @@ class ZoDiscordBot(commands.Bot):
         if message.author.bot:
             return
 
+        if message.type != discord.MessageType.default:
+            return
+
         allowed_users = self.config.get("allowed_users", [])
         if allowed_users and str(message.author.id) not in allowed_users:
             return
