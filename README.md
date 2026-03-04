@@ -58,10 +58,10 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 
 ### 3. Configure Zo Secrets
 
-Add these as Zo secrets (Settings → Developers → Secrets):
+Add these as Zo secrets (Settings → Advanced → Secrets):
 
 - `DISCORD_BOT_TOKEN` — Your bot token from step 1
-- `DISCORD_ZO_API_KEY` — Your Zo API key (Settings → Developers → API Keys)
+- `DISCORD_ZO_API_KEY` — Your Zo API key (Settings → Advanced → Access Tokens)
 
 ### 4. Clone and Install
 
@@ -142,7 +142,7 @@ cp -r skill/ /home/workspace/Skills/zo-discord/
 3. Bot creates a thread with Zo's response
 4. Thread-to-conversation mapping is stored in SQLite
 5. Follow-up messages in the thread continue the same Zo session
-6. Scheduled Zo agents can post to Discord via the CLI or HTTP API, preserving session continuity
+6. Scheduled Zo agents can use the CLI to spawn new Discord threads linked to their active session
 
 ## CLI Reference
 
