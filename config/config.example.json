@@ -2,8 +2,12 @@
   "guild_id": "YOUR_DISCORD_SERVER_ID",
   "allowed_users": ["YOUR_DISCORD_USER_ID"],
   "model": null,
+  "model_aliases": {},
+  "default_persona": null,
+  "persona_aliases": {},
   "notification_port": 8787,
   "max_message_length": 1900,
+  "data_dir": "discord_data",
   "thinking_mode": "streaming",
   "auto_archive_override": true
 }

@@ -8,7 +8,9 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "data" / "threads.db"
+from zo_discord import PROJECT_ROOT
+
+DB_PATH = PROJECT_ROOT / "data" / "threads.db"
 
 
 async def init_db():
@@ -41,7 +43,6 @@ async def init_db():
                 instructions TEXT,
                 persona_id TEXT,
                 memory_paths TEXT DEFAULT '[]',
-                thread_history INTEGER DEFAULT 0,
                 updated_at TEXT NOT NULL
             )
         """)
@@ -59,6 +60,10 @@ async def init_db():
             pass
         try:
             await db.execute("UPDATE thread_mappings SET watched = 0 WHERE manually_archived = 1")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN model TEXT DEFAULT NULL")
         except:
             pass
         await db.commit()
@@ -176,9 +181,6 @@ async def get_channel_config(channel_id: str) -> dict | None:
         config = dict(row)
         import json
         config["memory_paths"] = json.loads(config.get("memory_paths") or "[]")
-        # Remove deprecated fields from response
-        config.pop("thread_history", None)
-        config.pop("persona_id", None)
         return config
 
 
@@ -191,15 +193,11 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
     if "memory_paths" in kwargs and isinstance(kwargs["memory_paths"], list):
         kwargs["memory_paths"] = json.dumps(kwargs["memory_paths"])
     
-    # Strip deprecated fields
-    kwargs.pop("thread_history", None)
-    kwargs.pop("persona_id", None)
-
     async with aiosqlite.connect(DB_PATH) as db:
         if existing:
             sets = []
             vals = []
-            for key in ("instructions", "memory_paths"):
+            for key in ("instructions", "memory_paths", "persona_id", "model"):
                 if key in kwargs:
                     sets.append(f"{key} = ?")
                     vals.append(kwargs[key])
@@ -213,12 +211,14 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
                 )
         else:
             await db.execute("""
-                INSERT INTO channel_config (channel_id, instructions, memory_paths, updated_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO channel_config (channel_id, instructions, memory_paths, persona_id, model, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 channel_id,
                 kwargs.get("instructions"),
                 kwargs.get("memory_paths", "[]"),
+                kwargs.get("persona_id"),
+                kwargs.get("model"),
                 now
             ))
         await db.commit()

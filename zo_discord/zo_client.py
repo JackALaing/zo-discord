@@ -25,7 +25,9 @@ class StreamResult:
     interrupted: bool  # stream broke before End event
     received_events: bool  # got any SSE events at all
 
-CONFIG_PATH = Path(__file__).parent / "config" / "config.json"
+from zo_discord import PROJECT_ROOT
+
+CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 
 # Streaming flush config
 FLUSH_MIN_SENTENCES = 3
@@ -73,6 +75,8 @@ class ZoClient:
         conversation_id: str = None,
         context_parts: list[dict] = None,
         context_paths: list[str] = None,
+        model_name: str = None,
+        persona_id: str = None,
     ) -> tuple[str, str]:
         """
         Send a message to Zo (non-streaming) via /zo/ask.
@@ -80,15 +84,18 @@ class ZoClient:
         Returns:
             Tuple of (response_text, conversation_id)
         """
+        effective_model = model_name or self.model
         payload = {
             "input": input_text,
             "stream": False,
         }
 
-        if self.model:
-            payload["model_name"] = self.model
+        if effective_model:
+            payload["model_name"] = effective_model
         if conversation_id:
             payload["conversation_id"] = conversation_id
+        if persona_id:
+            payload["persona_id"] = persona_id
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -139,8 +146,8 @@ class ZoClient:
                     "stream": False,
                     "conversation_id": conv_id,
                 }
-                if self.model:
-                    retry_payload["model_name"] = self.model
+                if effective_model:
+                    retry_payload["model_name"] = effective_model
                 try:
                     async with aiohttp.ClientSession(timeout=timeout) as session:
                         async with session.post(
@@ -177,6 +184,8 @@ class ZoClient:
         file_paths: list[str] = None,
         on_thinking: Callable[[str], Awaitable[None]] = None,
         on_conv_id: Callable[[str], Awaitable[None]] = None,
+        model_name: str = None,
+        persona_id: str = None,
     ) -> StreamResult:
         """
         Send a message to Zo via the /zo/ask streaming endpoint.
@@ -199,15 +208,20 @@ class ZoClient:
             paths_str = "\n".join(f"- `{p}`" for p in file_paths)
             full_input = f"{full_input}\n\n## Referenced Files\n{paths_str}"
 
+        effective_model = model_name or self.model
         payload = {
             "input": full_input,
             "stream": True,
         }
 
-        if self.model:
-            payload["model_name"] = self.model
+        if effective_model:
+            payload["model_name"] = effective_model
         if conversation_id:
             payload["conversation_id"] = conversation_id
+        if persona_id:
+            payload["persona_id"] = persona_id
+
+        logger.info(f"Sending to Zo API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}")
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -445,6 +459,7 @@ class ZoClient:
         conversation_id: str,
         on_thinking: Callable[[str], Awaitable[None]] = None,
         on_conv_id: Callable[[str], Awaitable[None]] = None,
+        model_name: str = None,
     ) -> StreamResult:
         """Send a follow-up message to an idle conversation via streaming.
 
@@ -455,48 +470,8 @@ class ZoClient:
             conversation_id=conversation_id,
             on_thinking=on_thinking,
             on_conv_id=on_conv_id,
+            model_name=model_name,
         )
-
-    async def stop_conversation(self, conversation_id: str) -> bool:
-        """
-        Stop an in-flight conversation.
-
-        Returns True if the stop was accepted, False otherwise.
-
-        BUG: This endpoint returns 401 with all available auth tokens.
-        The /stop/{conversation_id} endpoint exists but requires host-level
-        auth (not the API key or client identity token available to us).
-        See: /home/workspace/Knowledge/bugs/zo-stop-endpoint-auth.md
-
-        Once this is fixed, enable the code below and replace the message
-        queuing in bot.py with true interrupt-then-redirect behavior.
-        """
-        # TODO: Uncomment once Zo API exposes stop with API key auth
-        #
-        # headers = {
-        #     "Authorization": f"Bearer {self.api_key}",
-        #     "Content-Type": "application/json",
-        # }
-        # timeout = aiohttp.ClientTimeout(total=30)
-        # try:
-        #     async with aiohttp.ClientSession(timeout=timeout) as session:
-        #         async with session.post(
-        #             f"{self.BASE_URL}/stop/{conversation_id}",
-        #             headers=headers,
-        #         ) as resp:
-        #             if resp.status == 200:
-        #                 logger.info(f"Stopped conversation {conversation_id}")
-        #                 return True
-        #             else:
-        #                 error_text = await resp.text()
-        #                 logger.warning(f"Failed to stop {conversation_id}: {resp.status} {error_text}")
-        #                 return False
-        # except Exception as e:
-        #     logger.error(f"Error stopping conversation {conversation_id}: {e}")
-        #     return False
-
-        logger.debug(f"stop_conversation({conversation_id}) is a no-op — endpoint requires host auth")
-        return False
 
     def generate_thread_title_simple(self, user_message: str) -> str:
         """
@@ -654,19 +629,20 @@ class ZoClient:
 
             total_width = sum(col_widths) + (max_cols - 1) * 2
 
-            # Wide tables -> bullet list format (readable on mobile)
+            # Wide tables -> structured list (readable on mobile)
             if total_width > 40:
                 header = rows[0] if rows else []
                 out_lines = []
                 for row in rows[1:]:
-                    parts = []
-                    for j, cell in enumerate(row):
+                    title = row[0] if row else ''
+                    out_lines.append(f'**{title}**')
+                    for j, cell in enumerate(row[1:], 1):
                         if j < len(header) and header[j]:
-                            parts.append(f"**{header[j]}**: {cell}")
+                            out_lines.append(f'- {header[j]}: {cell}')
                         else:
-                            parts.append(cell)
-                    out_lines.append('- ' + ' \u2014 '.join(parts))
-                return '\n'.join(out_lines)
+                            out_lines.append(f'- {cell}')
+                    out_lines.append('')
+                return '\n'.join(out_lines).rstrip()
 
             # Narrow tables -> code block (looks good everywhere)
             out_lines = []
@@ -691,10 +667,17 @@ class ZoClient:
         text = re.sub(r'^(\s*)- \[x\] ', r'\1- ✓ ', text, flags=re.MULTILINE)
         text = re.sub(r'^(\s*)- \[ \] ', r'\1- ', text, flags=re.MULTILINE)
 
-        # 5. Suppress URL embeds by wrapping bare URLs in <>
+        # 5. Collapse [url](url) links where the text IS a URL — Discord won't render these as masked links
+        text = re.sub(
+            r'\[(https?://[^\]]+)\]\(https?://[^)]+\)',
+            r'\1',
+            text
+        )
+
+        # 6. Suppress URL embeds by wrapping bare URLs in <>
         # Skip URLs already inside markdown links [text](url) or already wrapped <url>
         text = re.sub(
-            r'(?<!\()(?<!<)(https?://[^\s>)\]]+)(?!\))',
+            r'(?<![(\[<])(https?://[^\s>)\]]+)(?!\))',
             r'<\1>',
             text
         )

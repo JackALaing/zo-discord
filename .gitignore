@@ -1,10 +1,17 @@
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+dist/
+build/
 *.db
 data/
 discord_data/
 logs/
 *.log
 .env
+.DS_Store
+venv/
+.venv/
+.pytest_cache/
 config/config.json

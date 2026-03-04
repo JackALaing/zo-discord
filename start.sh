@@ -1,4 +1,4 @@
 #!/bin/bash
 source /root/.zo_secrets
-cd /home/workspace/Services/zo-discord
-exec python -u bot.py
+cd "$(dirname "$0")"
+exec python -u -m zo_discord.bot

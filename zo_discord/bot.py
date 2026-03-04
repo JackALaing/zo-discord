@@ -20,17 +20,15 @@ import logging
 import uuid
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-
-from db import (
+from zo_discord.db import (
     init_db, save_mapping, get_conversation_id, update_activity,
     get_active_threads, update_thread_name, update_conversation_id,
     get_channel_config, set_channel_config, delete_channel_config,
     update_thread_status, get_thread_status, get_mapping_by_conversation,
     set_watched, is_watched, get_all_watched_threads
 )
-from zo_client import ZoClient, load_config
-from commands import setup_commands
+from zo_discord.zo_client import ZoClient, load_config
+from zo_discord.commands import setup_commands
 
 logging.basicConfig(
     level=logging.INFO,
@@ -249,6 +247,55 @@ class ZoDiscordBot(commands.Bot):
 
         setup_commands(self)
 
+    def extract_model_prefix(self, text: str) -> tuple[str | None, str]:
+        """Extract a /model-alias prefix from the start of a message.
+
+        Returns (model_id_or_none, remaining_text).
+        If the message starts with /alias where alias is a key in model_aliases,
+        strips it and returns the resolved model ID.
+        """
+        if not text.startswith("/"):
+            return None, text
+        parts = text.split(None, 1)
+        alias = parts[0][1:]  # strip leading /
+        config = load_config()
+        aliases = config.get("model_aliases", {})
+        logger.debug(f"Checking alias '{alias}' against {list(aliases.keys())}")
+        if alias in aliases:
+            remaining = parts[1] if len(parts) > 1 else ""
+            logger.info(f"Resolved alias '{alias}' to model {aliases[alias]}")
+            return aliases[alias], remaining
+        return None, text
+
+    def extract_persona_prefix(self, text: str) -> tuple[str | None, str]:
+        """Extract an @persona-alias prefix from the start of a message.
+
+        Returns (persona_id_or_none, remaining_text).
+        If the message starts with @alias where alias is a key in persona_aliases,
+        strips it and returns the resolved persona ID.
+        """
+        if not text.startswith("@"):
+            return None, text
+        parts = text.split(None, 1)
+        alias = parts[0][1:]  # strip leading @
+        config = load_config()
+        aliases = config.get("persona_aliases", {})
+        if alias in aliases:
+            remaining = parts[1] if len(parts) > 1 else ""
+            logger.info(f"Resolved persona alias '{alias}' to {aliases[alias]}")
+            return aliases[alias], remaining
+        return None, text
+
+    async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None]:
+        """Get the effective model and persona for a channel.
+
+        Returns (model_id_or_none, persona_id_or_none) from channel_config.
+        """
+        ch_config = await get_channel_config(channel_id)
+        if not ch_config:
+            return None, None
+        return ch_config.get("model"), ch_config.get("persona_id")
+
     async def on_ready(self):
         if not self._initialized:
             self._initialized = True
@@ -416,6 +463,26 @@ class ZoDiscordBot(commands.Bot):
     async def handle_channel_message(self, message: discord.Message):
         logger.info(f"New message in #{message.channel.name} from {message.author}")
 
+        # Extract per-message model and persona overrides (either order)
+        model_override, user_text = self.extract_model_prefix(message.content)
+        persona_override, user_text = self.extract_persona_prefix(user_text)
+        if not model_override:
+            model_override, user_text = self.extract_model_prefix(user_text)
+        if not persona_override:
+            persona_override, user_text = self.extract_persona_prefix(user_text)
+        if model_override:
+            logger.info(f"Model override detected: {model_override}")
+        if persona_override:
+            logger.info(f"Persona override detected: {persona_override}")
+
+        # Resolve channel defaults (model, persona)
+        channel_model, channel_persona = await self.resolve_channel_defaults(str(message.channel.id))
+
+        # Priority: message prefix > channel default > global default
+        effective_model = model_override or channel_model  # global default handled by ZoClient
+        config = load_config()
+        effective_persona = persona_override or channel_persona or config.get("default_persona")
+
         attachment_paths = []
         if message.attachments:
             att_dir = get_attachments_dir(message.channel.name)
@@ -428,7 +495,7 @@ class ZoDiscordBot(commands.Bot):
                     logger.error(f"Failed to save attachment: {e}")
 
         # Create thread BEFORE calling Zo so thinking previews have somewhere to go
-        simple_title = self.zo.generate_thread_title_simple(message.content)
+        simple_title = self.zo.generate_thread_title_simple(user_text)
         thread = await message.create_thread(
             name=simple_title[:100],
         )
@@ -461,11 +528,13 @@ class ZoDiscordBot(commands.Bot):
                 file_paths.extend(attachment_paths)
 
             result = await self.zo.ask_stream(
-                message.content,
+                user_text,
                 context=context or None,
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                model_name=effective_model,
+                persona_id=effective_persona,
             )
             response, conv_id = result.output, result.conv_id
 
@@ -558,6 +627,32 @@ class ZoDiscordBot(commands.Bot):
             await send_suppressed(thread, content=f"*Queued — will process after current turn finishes.*")
             return
 
+        # Extract per-message model and persona overrides (either order)
+        model_override, user_text = self.extract_model_prefix(message.content)
+        persona_override, user_text = self.extract_persona_prefix(user_text)
+        if not model_override:
+            model_override, user_text = self.extract_model_prefix(user_text)
+        if not persona_override:
+            persona_override, user_text = self.extract_persona_prefix(user_text)
+        if model_override:
+            logger.info(f"Model override detected in thread: {model_override}")
+        if persona_override:
+            logger.info(f"Persona override detected in thread: {persona_override}")
+
+        # For new conversations (first reply to notification threads), apply channel defaults
+        parent_channel_id = str(thread.parent.id) if thread.parent else None
+        effective_model = model_override
+        effective_persona = persona_override
+        if not conv_id and parent_channel_id:
+            channel_model, channel_persona = await self.resolve_channel_defaults(parent_channel_id)
+            if not effective_model:
+                effective_model = channel_model
+            if not effective_persona:
+                effective_persona = channel_persona
+        if not effective_persona:
+            config = load_config()
+            effective_persona = config.get("default_persona")
+
         is_first_reply = conv_id == ""
         context, file_paths = await self.build_thread_context(thread, include_source=is_first_reply)
 
@@ -604,7 +699,7 @@ class ZoDiscordBot(commands.Bot):
             except Exception as e:
                 logger.warning(f"Failed to resolve reply reference: {e}")
 
-        user_input = reply_context + message.content
+        user_input = reply_context + user_text
 
         # If this message was bundled with earlier queued messages, prepend them
         bundled_prefix = self._bundled_prefixes.pop(message.id, None)
@@ -632,6 +727,8 @@ class ZoDiscordBot(commands.Bot):
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                model_name=effective_model,
+                persona_id=effective_persona,
             )
             response, new_conv_id = result.output, result.conv_id
 
@@ -874,28 +971,19 @@ class ZoDiscordBot(commands.Bot):
         file_paths = []
         ch_config = await get_channel_config(str(channel.id))
 
-        # Always include channel folder
         channel_dir = get_channel_dir(channel.name)
         channel_dir_str = str(channel_dir)
-        file_paths.append(channel_dir_str)
+        channel_mention = "<#" + str(channel.id) + ">"
 
         if include_source:
             # === FIRST MESSAGE: full context ===
 
             sections.append(
                 "## Message Source\n"
-                "This message is from Discord (channel: #" + channel.name + "). "
+                "This message is from Discord (channel: " + channel_mention + "). "
                 "Reply normally \u2014 your response will appear in the thread. "
-                "Do not use the Discord API to send your reply."
-            )
-
-            sections.append(
-                "## Channel Workspace\n"
-                "This channel's workspace folder is: `" + channel_dir_str + "`\n"
-                "- **Start of conversation**: Read this folder for any relevant context, notes, or files from previous conversations.\n"
-                "- **Memory requests**: If the user asks you to remember something, save a file, or add notes for this channel, "
-                "write them to this folder (e.g. `" + channel_dir_str + "/notes.md`).\n"
-                "- **Attachments**: User-uploaded files are saved to `" + channel_dir_str + "/attachments/`."
+                'Before replying, rename the thread with `zo-discord rename "Descriptive Title"` '
+                "(3-6 words, specific and scannable)."
             )
 
             if ch_config:
@@ -919,27 +1007,10 @@ class ZoDiscordBot(commands.Bot):
             except discord.Forbidden:
                 pass
 
-            if not thread:
-                sections.append(
-                    "## Thread Naming\n"
-                    "Name this thread: `zo-discord rename \"Descriptive Title\"`\n"
-                    "3-6 words, max 50 chars. Be specific and scannable. Do this before responding."
-                )
-            elif thread:
-                clean_name = strip_status_prefix(thread.name)
-                sections.append(
-                    "## Thread Info\n"
-                    "- **Current Name**: " + clean_name + "\n\n"
-                    "Rename this thread based on the conversation topic (3-6 words, max 50 chars, silently):\n"
-                    '`zo-discord rename "New title"`'
-                )
-
             sections.append(
                 "## Discord Tools\n"
-                "CLI: `zo-discord <command>` (thread auto-detected)\n"
-                'Spawn a new thread: `zo-discord new-thread "Title" "context/prompt"`\n'
-                'Ask user to choose? Use buttons: `zo-discord buttons "Question?" "Option A:primary" "Option B:secondary"`\n'
-                "Full Discord API docs: `Skills/zo-discord/SKILL.md`"
+                "For more tools to interact with Discord, like spawning new threads and "
+                "presenting the user with button forms, see the zo-discord skill."
             )
 
         else:
@@ -947,14 +1018,11 @@ class ZoDiscordBot(commands.Bot):
             if thread:
                 clean_name = strip_status_prefix(thread.name)
                 sections.append(
-                    "## Thread Info\n"
-                    "- **Current Name**: " + clean_name + "\n"
-                    "- **Channel workspace**: `" + channel_dir_str + "`\n\n"
-                    "You are in a Discord thread. Reply normally \u2014 do not use the Discord API to send your reply.\n"
-                    'Rename if topic shifted: `zo-discord rename "New title"`\n'
-                    'Spawn a new thread: `zo-discord new-thread "Title" "context/prompt"`\n'
-                    'Ask user to choose? Use buttons: `zo-discord buttons "Question?" "Option A:primary" "Option B:secondary"`\n'
-                    "Full Discord API docs: `Skills/zo-discord/SKILL.md`"
+                    "## Message Source\n"
+                    "This message is from Discord (channel: " + channel_mention + "; "
+                    'thread: "' + clean_name + '"). '
+                    "Reply normally. "
+                    'If the topic has shifted from the thread name, rename first: `zo-discord rename "New Title"`'
                 )
 
         return "\n\n".join(sections), file_paths
@@ -1055,6 +1123,21 @@ class ZoDiscordBot(commands.Bot):
                 if ch.name == name:
                     return ch
         return None
+
+    def resolve_channel(self, identifier: str):
+        """Resolve a channel by numeric ID or name. Returns (channel, error_msg) tuple.
+        error_msg is a string if resolution failed, None on success."""
+        if not identifier:
+            return None, "channel_id or channel_name is required"
+        if identifier.isdigit():
+            channel = self.get_channel(int(identifier))
+            if not channel:
+                return None, f"Channel not found: {identifier}"
+            return channel, None
+        channel = self.resolve_channel_by_name(identifier)
+        if not channel:
+            return None, f"No channel found with name '{identifier}'"
+        return channel, None
 
     async def handle_notify(self, request: web.Request) -> web.Response:
         """Create a notification thread in a channel.
@@ -1336,12 +1419,13 @@ class ZoDiscordBot(commands.Bot):
 
         POST /react
         {"channel_id": "123", "message_id": "456", "emoji": "\u2705"}
+        Accepts channel_name instead of channel_id.
         """
         try:
             data = await request.json()
-            channel = self.get_channel(int(data["channel_id"]))
-            if not channel:
-                return web.json_response({"error": "Channel not found"}, status=404)
+            channel, err = self.resolve_channel(data.get("channel_name") or data.get("channel_id", ""))
+            if err:
+                return web.json_response({"error": err}, status=404)
 
             message = await channel.fetch_message(int(data["message_id"]))
             await message.add_reaction(data["emoji"])
@@ -1357,12 +1441,13 @@ class ZoDiscordBot(commands.Bot):
 
         POST /messages/edit
         {"channel_id": "123", "message_id": "456", "content": "New content"}
+        Accepts channel_name instead of channel_id.
         """
         try:
             data = await request.json()
-            channel = self.get_channel(int(data["channel_id"]))
-            if not channel:
-                return web.json_response({"error": "Channel not found"}, status=404)
+            channel, err = self.resolve_channel(data.get("channel_name") or data.get("channel_id", ""))
+            if err:
+                return web.json_response({"error": err}, status=404)
 
             message = await channel.fetch_message(int(data["message_id"]))
             if message.author.id != self.user.id:
@@ -1381,12 +1466,13 @@ class ZoDiscordBot(commands.Bot):
 
         DELETE /messages
         {"channel_id": "123", "message_id": "456"}
+        Accepts channel_name instead of channel_id.
         """
         try:
             data = await request.json()
-            channel = self.get_channel(int(data["channel_id"]))
-            if not channel:
-                return web.json_response({"error": "Channel not found"}, status=404)
+            channel, err = self.resolve_channel(data.get("channel_name") or data.get("channel_id", ""))
+            if err:
+                return web.json_response({"error": err}, status=404)
 
             message = await channel.fetch_message(int(data["message_id"]))
             if message.author.id != self.user.id:
@@ -1405,12 +1491,13 @@ class ZoDiscordBot(commands.Bot):
 
         POST /messages/send
         {"channel_id": "123", "content": "Hello"}
+        Accepts channel_name instead of channel_id.
         """
         try:
             data = await request.json()
-            channel = self.get_channel(int(data["channel_id"]))
-            if not channel:
-                return web.json_response({"error": "Channel not found"}, status=404)
+            channel, err = self.resolve_channel(data.get("channel_name") or data.get("channel_id", ""))
+            if err:
+                return web.json_response({"error": err}, status=404)
 
             chunks = self.zo.chunk_response(data["content"])
             msg = None
@@ -1597,6 +1684,11 @@ class ZoDiscordBot(commands.Bot):
 
             context, file_paths = await self.build_channel_context(channel, include_source=True, thread=thread)
 
+            # Resolve channel model/persona defaults
+            channel_model, channel_persona = await self.resolve_channel_defaults(str(channel.id))
+            config = load_config()
+            effective_persona = channel_persona or config.get("default_persona")
+
             thread_id_str = str(thread.id)
 
             on_thinking = self.make_on_thinking(thread)
@@ -1610,6 +1702,8 @@ class ZoDiscordBot(commands.Bot):
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                model_name=channel_model,
+                persona_id=effective_persona,
             )
             response, new_conv_id = result.output, result.conv_id
 
@@ -1695,14 +1789,20 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_get_channel_config(self, request: web.Request) -> web.Response:
-        channel_id = request.match_info["channel_id"]
+        channel, err = self.resolve_channel(request.match_info["channel_id"])
+        if err:
+            return web.json_response({"error": err}, status=404)
+        channel_id = str(channel.id)
         config = await get_channel_config(channel_id)
         if not config:
             return web.json_response({"error": "No config for this channel"}, status=404)
         return web.json_response(config)
 
     async def handle_set_channel_config(self, request: web.Request) -> web.Response:
-        channel_id = request.match_info["channel_id"]
+        channel, err = self.resolve_channel(request.match_info["channel_id"])
+        if err:
+            return web.json_response({"error": err}, status=404)
+        channel_id = str(channel.id)
         try:
             data = await request.json()
             await set_channel_config(channel_id, **data)
@@ -1713,7 +1813,10 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_delete_channel_config(self, request: web.Request) -> web.Response:
-        channel_id = request.match_info["channel_id"]
+        channel, err = self.resolve_channel(request.match_info["channel_id"])
+        if err:
+            return web.json_response({"error": err}, status=404)
+        channel_id = str(channel.id)
         try:
             await delete_channel_config(channel_id)
             return web.json_response({"success": True})
@@ -1744,7 +1847,8 @@ def main():
         key_status = "\u2713 Set" if api_key else "\u2717 Not set"
         print(f"DISCORD_BOT_TOKEN: {token_status}")
         print(f"DISCORD_ZO_API_KEY: {key_status}")
-        print(f"Config: {Path(__file__).parent / 'config' / 'config.json'}")
+        from zo_discord import PROJECT_ROOT
+        print(f"Config: {PROJECT_ROOT / 'config' / 'config.json'}")
 
         if not token or not api_key:
             print("\nAdd missing secrets at: Settings > Developers")

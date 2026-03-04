@@ -3,7 +3,7 @@ name: zo-discord
 description: Send notifications and interact with Discord — threads, embeds, buttons, files, reactions, and channel config. Use when a scheduled agent needs to deliver results to Discord, when you need to send interactive UI elements, or when managing per-channel context.
 compatibility: Created for Zo Computer
 metadata:
-  author: jackal.zo.computer
+  author: JackALaing
 ---
 # Discord Notify & CLI
 
@@ -141,7 +141,11 @@ curl -sS -X POST "http://localhost:8787/channels/CHANNEL_ID/config" -H "Content-
 Get config: `GET /channels/CHANNEL_ID/config`
 Delete config: `DELETE /channels/CHANNEL_ID/config`
 
-Fields: `instructions` (text), `memory_paths` (array of workspace-relative paths)
+Fields:
+- `instructions` (text) — injected into every thread's context as "Channel Instructions". Replaces the channel topic as context when set.
+- `memory_paths` (array of workspace-relative paths) — each path is passed to Zo as a file to read at the start of every conversation in that channel. zo-discord has no built-in memory system — these paths should point to files maintained by an external memory system.
+- `model` (string) — model ID override for this channel. Overrides the global default.
+- `persona_id` (string) — persona ID override for this channel. Overrides the global default.
 
 ### Health Check
 
@@ -179,7 +183,7 @@ Messages over 2000 characters are automatically split at topic boundaries: `**bo
 ## Discord Formatting
 
 The bot automatically reformats markdown before sending to Discord:
-- **Tables** → monospaced code blocks with aligned columns
+- **Tables** → wide tables become bullet outlines with bold headers; narrow tables become monospaced code blocks
 - **Footnotes** (`[^1]` + definitions) → inline masked links `[domain](url)`
 - **Horizontal rules** (`---`, `***`) → removed
 - **Task lists** (`- [ ]`, `- [x]`) → plain lists (`-`, `- ✓`)
@@ -194,7 +198,7 @@ The `zo-discord` CLI auto-detects the conversation ID from:
 
 It calls `POST /conversations/{conv_id}/action`, which resolves the Discord thread ID internally. No thread ID needed.
 
-Symlinked to `/usr/local/bin/zo-discord` for global access.
+Install with `ln -sf /path/to/zo-discord/skill/scripts/discord-cli.sh /usr/local/bin/zo-discord` for global access (see README).
 
 ## How the Bot Works
 
@@ -206,6 +210,6 @@ Symlinked to `/usr/local/bin/zo-discord` for global access.
 6. Channel config (instructions, memory) is injected into every thread's context
 7. Buttons inject user choices back into the Zo conversation
 8. File attachments from user messages are saved and paths passed to Zo
-9. First message gets full context (source, channel config, pins, thread naming instructions, tools)
+9. First message gets full context (source, channel instructions, memory paths, channel topic as fallback, pinned messages, thread naming instructions, tools)
 10. Follow-up messages get compact context (thread name, reply reminder, rename hints, skill link)
 11. Agent replies normally — responses are automatically piped into the Discord thread
