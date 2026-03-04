@@ -260,7 +260,8 @@ zo-discord/
 │   ├── bot.py              # Main bot — event handlers, HTTP API, message processing
 │   ├── zo_client.py        # Zo API client — streaming, retries, title generation
 │   ├── db.py               # SQLite database — thread mappings, channel config
-│   └── commands.py         # Slash commands and UI components
+│   ├── commands.py         # Slash commands and UI components
+│   └── utils.py            # Pure utility functions (status prefixes)
 ├── config/
 │   ├── config.json         # Your config (gitignored)
 │   └── config.example.json # Config template
@@ -269,6 +270,8 @@ zo-discord/
 │   ├── scheduled-agent-example.md     # Example scheduled agent
 │   └── scripts/
 │       └── discord-cli.sh             # CLI script
+├── tests/
+│   └── test_formatting.py  # Tests for formatting, chunking, and title generation
 ├── start.sh                # Service entrypoint (sources secrets, runs bot)
 ├── pyproject.toml          # Package metadata and dependencies
 ├── LICENSE

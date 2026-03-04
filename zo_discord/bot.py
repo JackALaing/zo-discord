@@ -29,6 +29,9 @@ from zo_discord.db import (
 )
 from zo_discord.zo_client import ZoClient, load_config
 from zo_discord.commands import setup_commands
+from zo_discord.utils import (
+    STATUS_EMOJI, set_thread_status_prefix, strip_status_prefix,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,25 +41,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CONFIG = load_config()
-
-STATUS_EMOJI = {
-    "error": "\u274c",
-}
-
-_STATUS_EMOJI_PATTERN = re.compile(r'^(?:\u274c)\s*')
-
-
-def set_thread_status_prefix(name: str, status: str | None) -> str:
-    """Add or replace status emoji prefix on thread name."""
-    cleaned = _STATUS_EMOJI_PATTERN.sub('', name)
-    if status and status in STATUS_EMOJI:
-        return f"{STATUS_EMOJI[status]} {cleaned}"
-    return cleaned
-
-
-def strip_status_prefix(name: str) -> str:
-    """Remove status emoji prefix from thread name."""
-    return _STATUS_EMOJI_PATTERN.sub('', name)
 
 
 DISCORD_BASE_DIR = Path(CONFIG.get("data_dir", "discord_data")).resolve()
@@ -1517,7 +1501,7 @@ class ZoDiscordBot(commands.Bot):
         """Set thread status.
 
         POST /threads/{thread_id}/status
-        {"status": "working|review|error|complete"}
+        {"status": "error|complete"}
         """
         thread_id = request.match_info["thread_id"]
         try:
@@ -1541,10 +1525,6 @@ class ZoDiscordBot(commands.Bot):
                 return web.json_response({"error": "Thread not found in Discord"}, status=404)
 
             await self.set_status(thread, status)
-
-            if status == "complete":
-                await set_watched(str(thread.id), False)
-                await thread.edit(archived=True)
 
             return web.json_response({"success": True, "status": status})
 

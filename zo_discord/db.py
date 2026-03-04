@@ -52,19 +52,19 @@ async def init_db():
         """)
         try:
             await db.execute("ALTER TABLE thread_mappings ADD COLUMN status TEXT DEFAULT NULL")
-        except:
+        except Exception:
             pass
         try:
             await db.execute("ALTER TABLE thread_mappings ADD COLUMN watched INTEGER DEFAULT 1")
-        except:
+        except Exception:
             pass
         try:
             await db.execute("UPDATE thread_mappings SET watched = 0 WHERE manually_archived = 1")
-        except:
+        except Exception:
             pass
         try:
             await db.execute("ALTER TABLE channel_config ADD COLUMN model TEXT DEFAULT NULL")
-        except:
+        except Exception:
             pass
         await db.commit()
 

@@ -73,8 +73,6 @@ class ZoClient:
         self,
         input_text: str,
         conversation_id: str = None,
-        context_parts: list[dict] = None,
-        context_paths: list[str] = None,
         model_name: str = None,
         persona_id: str = None,
     ) -> tuple[str, str]:
@@ -493,11 +491,11 @@ class ZoClient:
         # Remove Discord spoilers (||text||)
         title = re.sub(r'\|\|[^|]+\|\|', '', title)
 
+        # Remove code blocks before inline code (inline code regex would eat inner backticks first)
+        title = re.sub(r'```[\s\S]*?```', '', title)
+
         # Remove inline code (`code`)
         title = re.sub(r'`[^`]+`', '', title)
-
-        # Remove code blocks (```code```)
-        title = re.sub(r'```[\s\S]*?```', '', title)
 
         # Remove custom emoji (<:name:id> or <a:name:id>)
         title = re.sub(r'<a?:\w+:\d+>', '', title)
