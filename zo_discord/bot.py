@@ -145,7 +145,7 @@ class ButtonCallbackView(ui.View):
                 view=None
             )
             conv_id = await get_conversation_id(self.thread_id)
-            if conv_id and conv_id != "":
+            if conv_id:
                 thread = self.bot.get_channel(int(self.thread_id))
                 if thread:
                     on_thinking = self.bot.make_on_thinking(thread)
@@ -231,44 +231,39 @@ class ZoDiscordBot(commands.Bot):
 
         setup_commands(self)
 
-    def extract_model_prefix(self, text: str) -> tuple[str | None, str]:
-        """Extract a /model-alias prefix from the start of a message.
+    def extract_overrides(self, text: str) -> tuple[str | None, str | None, str]:
+        """Extract /model-alias and @persona-alias prefixes in either order.
 
-        Returns (model_id_or_none, remaining_text).
-        If the message starts with /alias where alias is a key in model_aliases,
-        strips it and returns the resolved model ID.
+        Returns (model_id_or_none, persona_id_or_none, remaining_text).
+        Supports both "/opus @pirate hello" and "@pirate /opus hello".
         """
-        if not text.startswith("/"):
-            return None, text
-        parts = text.split(None, 1)
-        alias = parts[0][1:]  # strip leading /
         config = load_config()
-        aliases = config.get("model_aliases", {})
-        logger.debug(f"Checking alias '{alias}' against {list(aliases.keys())}")
-        if alias in aliases:
-            remaining = parts[1] if len(parts) > 1 else ""
-            logger.info(f"Resolved alias '{alias}' to model {aliases[alias]}")
-            return aliases[alias], remaining
-        return None, text
+        model_aliases = config.get("model_aliases", {})
+        persona_aliases = config.get("persona_aliases", {})
 
-    def extract_persona_prefix(self, text: str) -> tuple[str | None, str]:
-        """Extract an @persona-alias prefix from the start of a message.
+        model_id = None
+        persona_id = None
+        remaining = text
 
-        Returns (persona_id_or_none, remaining_text).
-        If the message starts with @alias where alias is a key in persona_aliases,
-        strips it and returns the resolved persona ID.
-        """
-        if not text.startswith("@"):
-            return None, text
-        parts = text.split(None, 1)
-        alias = parts[0][1:]  # strip leading @
-        config = load_config()
-        aliases = config.get("persona_aliases", {})
-        if alias in aliases:
-            remaining = parts[1] if len(parts) > 1 else ""
-            logger.info(f"Resolved persona alias '{alias}' to {aliases[alias]}")
-            return aliases[alias], remaining
-        return None, text
+        for _ in range(2):
+            parts = remaining.split(None, 1)
+            if not parts:
+                break
+            token = parts[0]
+            rest = parts[1] if len(parts) > 1 else ""
+
+            if not model_id and token.startswith("/") and token[1:] in model_aliases:
+                model_id = model_aliases[token[1:]]
+                logger.info(f"Resolved model alias '{token[1:]}' to {model_id}")
+                remaining = rest
+            elif not persona_id and token.startswith("@") and token[1:] in persona_aliases:
+                persona_id = persona_aliases[token[1:]]
+                logger.info(f"Resolved persona alias '{token[1:]}' to {persona_id}")
+                remaining = rest
+            else:
+                break
+
+        return model_id, persona_id, remaining
 
     async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None]:
         """Get the effective model and persona for a channel.
@@ -450,13 +445,8 @@ class ZoDiscordBot(commands.Bot):
     async def handle_channel_message(self, message: discord.Message):
         logger.info(f"New message in #{message.channel.name} from {message.author}")
 
-        # Extract per-message model and persona overrides (either order)
-        model_override, user_text = self.extract_model_prefix(message.content)
-        persona_override, user_text = self.extract_persona_prefix(user_text)
-        if not model_override:
-            model_override, user_text = self.extract_model_prefix(user_text)
-        if not persona_override:
-            persona_override, user_text = self.extract_persona_prefix(user_text)
+        # Extract per-message model and persona overrides (supports either order)
+        model_override, persona_override, user_text = self.extract_overrides(message.content)
         if model_override:
             logger.info(f"Model override detected: {model_override}")
         if persona_override:
@@ -556,7 +546,7 @@ class ZoDiscordBot(commands.Bot):
         except asyncio.CancelledError:
             logger.info(f"Channel message request cancelled (interrupted) for thread {thread_id}")
         except Exception as e:
-            logger.error(f"Error handling message: {e}", exc_info=True)
+            logger.error(f"Error handling message in #{message.channel.name} from {message.author}: {e}", exc_info=True)
             try:
                 await self.set_status(thread, "error")
             except Exception:
@@ -614,13 +604,8 @@ class ZoDiscordBot(commands.Bot):
             await send_suppressed(thread, content=f"*Queued — will process after current turn finishes.*")
             return
 
-        # Extract per-message model and persona overrides (either order)
-        model_override, user_text = self.extract_model_prefix(message.content)
-        persona_override, user_text = self.extract_persona_prefix(user_text)
-        if not model_override:
-            model_override, user_text = self.extract_model_prefix(user_text)
-        if not persona_override:
-            persona_override, user_text = self.extract_persona_prefix(user_text)
+        # Extract per-message model and persona overrides (supports either order)
+        model_override, persona_override, user_text = self.extract_overrides(message.content)
         if model_override:
             logger.info(f"Model override detected in thread: {model_override}")
         if persona_override:
@@ -790,7 +775,7 @@ class ZoDiscordBot(commands.Bot):
                             await send_suppressed(thread, **kwargs)
                         recovered = True
                 except Exception as recovery_err:
-                    logger.error(f"Recovery failed for conv {recovery_conv_id}: {recovery_err}")
+                    logger.error(f"Recovery failed for conv {recovery_conv_id} in thread {thread_id}: {recovery_err}")
             if not recovered:
                 error_msg = str(e)
                 conv_label = f"\nConversation: `{recovery_conv_id}`" if recovery_conv_id else ""
@@ -886,7 +871,7 @@ class ZoDiscordBot(commands.Bot):
             await asyncio.sleep(delay)
 
             try:
-                result = await self.zo.send_continue(
+                result = await self.zo.ask_stream(
                     retry_input,
                     conversation_id=conv_id,
                     on_thinking=on_thinking,
@@ -1252,7 +1237,7 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"success": True, "name": display_name})
 
         except Exception as e:
-            logger.error(f"Rename error: {e}")
+            logger.error(f"Rename error for thread {thread_id}: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_buttons(self, request: web.Request) -> web.Response:
@@ -1420,7 +1405,7 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"success": True})
 
         except Exception as e:
-            logger.error(f"React error: {e}")
+            logger.error(f"React error (channel={data.get('channel_name') or data.get('channel_id')}, msg={data.get('message_id')}): {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_edit_message(self, request: web.Request) -> web.Response:
@@ -1445,7 +1430,7 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"success": True})
 
         except Exception as e:
-            logger.error(f"Edit error: {e}")
+            logger.error(f"Edit error (channel={data.get('channel_name') or data.get('channel_id')}, msg={data.get('message_id')}): {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_delete_message(self, request: web.Request) -> web.Response:
@@ -1470,7 +1455,7 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"success": True})
 
         except Exception as e:
-            logger.error(f"Delete error: {e}")
+            logger.error(f"Delete error (channel={data.get('channel_name') or data.get('channel_id')}, msg={data.get('message_id')}): {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_send_message(self, request: web.Request) -> web.Response:
@@ -1497,7 +1482,7 @@ class ZoDiscordBot(commands.Bot):
             })
 
         except Exception as e:
-            logger.error(f"Send error: {e}")
+            logger.error(f"Send error (channel={data.get('channel_name') or data.get('channel_id')}): {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_set_status(self, request: web.Request) -> web.Response:
@@ -1532,7 +1517,7 @@ class ZoDiscordBot(commands.Bot):
             return web.json_response({"success": True, "status": status})
 
         except Exception as e:
-            logger.error(f"Status error: {e}")
+            logger.error(f"Status error for thread {thread_id}: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_conversation_action(self, request: web.Request) -> web.Response:

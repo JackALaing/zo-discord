@@ -49,10 +49,21 @@ def _count_sentences(text: str) -> int:
     return len(re.findall(r'[.!?](?:\s|$)', text))
 
 
+_config_cache = None
+_config_cache_time = 0.0
+_CONFIG_TTL = 5.0  # seconds
+
+
 def load_config() -> dict:
-    """Load bot configuration."""
+    """Load bot configuration, cached for 5 seconds."""
+    global _config_cache, _config_cache_time
+    now = time.monotonic()
+    if _config_cache is not None and (now - _config_cache_time) < _CONFIG_TTL:
+        return _config_cache
     with open(CONFIG_PATH) as f:
-        return json.load(f)
+        _config_cache = json.load(f)
+    _config_cache_time = now
+    return _config_cache
 
 
 class ZoClient:
@@ -68,111 +79,6 @@ class ZoClient:
         config = load_config()
         self.model = config.get("model")
         self.max_length = config.get("max_message_length", 1900)
-
-    async def ask(
-        self,
-        input_text: str,
-        conversation_id: str = None,
-        model_name: str = None,
-        persona_id: str = None,
-    ) -> tuple[str, str]:
-        """
-        Send a message to Zo (non-streaming) via /zo/ask.
-
-        Returns:
-            Tuple of (response_text, conversation_id)
-        """
-        effective_model = model_name or self.model
-        payload = {
-            "input": input_text,
-            "stream": False,
-        }
-
-        if effective_model:
-            payload["model_name"] = effective_model
-        if conversation_id:
-            payload["conversation_id"] = conversation_id
-        if persona_id:
-            payload["persona_id"] = persona_id
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-
-        timeout = aiohttp.ClientTimeout(total=1800)
-
-        # Retry loop for session pool exhaustion (all sessions busy).
-        # This is distinct from conversation-specific 409s — the API couldn't
-        # allocate any session at all. Wait with longer delays and re-POST.
-        for pool_attempt, pool_delay in enumerate(SESSION_POOL_RETRY_DELAYS):
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self.BASE_URL}/zo/ask",
-                    headers=headers,
-                    json=payload
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        if _is_session_pool_error(error_text) and pool_attempt < len(SESSION_POOL_RETRY_DELAYS) - 1:
-                            logger.warning(
-                                f"Session pool full ({resp.status}), retry {pool_attempt + 1}/{len(SESSION_POOL_RETRY_DELAYS)} in {pool_delay}s"
-                            )
-                            await asyncio.sleep(pool_delay)
-                            continue
-                        raise Exception(f"Zo API error {resp.status}: {error_text}")
-
-                    data = await resp.json()
-                    output = data["output"]
-                    conv_id = data["conversation_id"]
-
-                if output and output.strip():
-                    return output, conv_id
-                break  # Got a 200 but empty — fall through to existing empty-response handling
-
-            logger.warning(f"Empty response from non-streaming ask (conv {conv_id}), trying wait_for_idle")
-            idle_result = await self.wait_for_idle(conv_id)
-            if idle_result and idle_result.output and idle_result.output.strip():
-                return idle_result.output, idle_result.conv_id
-
-            retry_delays = [15, 30, 60]
-            for attempt, delay in enumerate(retry_delays, 1):
-                logger.warning(f"Empty response (conv {conv_id}), continue attempt {attempt}/{len(retry_delays)} in {delay}s")
-                await asyncio.sleep(delay)
-                retry_payload = {
-                    "input": "Please continue.",
-                    "stream": False,
-                    "conversation_id": conv_id,
-                }
-                if effective_model:
-                    retry_payload["model_name"] = effective_model
-                try:
-                    async with aiohttp.ClientSession(timeout=timeout) as session:
-                        async with session.post(
-                            f"{self.BASE_URL}/zo/ask",
-                            headers=headers,
-                            json=retry_payload
-                        ) as resp:
-                            if resp.status == 409:
-                                logger.info(f"Conv {conv_id} busy on continue attempt {attempt}, waiting")
-                                idle_result = await self.wait_for_idle(conv_id)
-                                if idle_result and idle_result.output and idle_result.output.strip():
-                                    return idle_result.output, idle_result.conv_id
-                                continue
-                            if resp.status != 200:
-                                error_text = await resp.text()
-                                raise Exception(f"Zo API error {resp.status} on continue attempt {attempt}: {error_text}")
-                            data = await resp.json()
-                            output = data["output"]
-                            conv_id = data["conversation_id"]
-                        if output and output.strip():
-                            logger.info(f"Continue attempt {attempt} succeeded for conv {conv_id}")
-                            return output, conv_id
-                except Exception as e:
-                    logger.error(f"Continue attempt {attempt} failed for conv {conv_id}: {e}")
-
-            logger.error(f"All retries exhausted for conv {conv_id}")
-            return "", conv_id
 
     async def ask_stream(
         self,
@@ -451,38 +357,16 @@ class ZoClient:
                         return content
         return ""
 
-    async def send_continue(
-        self,
-        input_text: str,
-        conversation_id: str,
-        on_thinking: Callable[[str], Awaitable[None]] = None,
-        on_conv_id: Callable[[str], Awaitable[None]] = None,
-        model_name: str = None,
-    ) -> StreamResult:
-        """Send a follow-up message to an idle conversation via streaming.
-
-        Used after wait_for_idle confirms the agent is no longer busy.
-        """
-        return await self.ask_stream(
-            input_text,
-            conversation_id=conversation_id,
-            on_thinking=on_thinking,
-            on_conv_id=on_conv_id,
-            model_name=model_name,
-        )
-
     def generate_thread_title_simple(self, user_message: str) -> str:
         """
         Generate a clean thread title from the user message.
         Cleans Discord formatting, URLs, mentions, etc. similar to thread-it bot.
         """
-        import re
-
         title = user_message.strip()
         if not title:
             return "New conversation"
 
-        # Remove Discord mentions (<@123>, <@!123>, <#123>, <@&123>)
+        # Remove Discord mentions
         title = re.sub(r'<[@#][!&]?\d+>', '', title)
 
         # Remove URLs
@@ -509,13 +393,6 @@ class ZoClient:
             title = title[:77] + "..."
 
         return title or "New conversation"
-
-    def generate_thread_title(self, user_message: str, zo_response: str = None) -> str:
-        """
-        Generate thread title - just uses simple truncation.
-        Smart naming via Claude is done separately in the bot via background task.
-        """
-        return self.generate_thread_title_simple(user_message)
 
     def chunk_response(self, text: str) -> list[str]:
         """
@@ -575,8 +452,6 @@ class ZoClient:
 
     def format_for_discord(self, text: str) -> str:
         """Transform markdown that doesn't render well in Discord."""
-        import re
-
         # 1. Convert footnote references to inline links
         # Collect footnote definitions first
         footnotes = {}
@@ -690,8 +565,6 @@ class ZoClient:
 
     def _split_by_topics(self, text: str) -> list[str]:
         """Split text into topic sections at meaningful boundaries."""
-        import re
-
         # Split on bold headers, markdown headers, horizontal rules, or numbered items after blank lines
         pattern = r'\n\n(?=\*\*[^*]+\*\*[:\s]|#{1,3}\s|\-{3,}|\d+\.\s)'
         parts = re.split(pattern, text)
@@ -718,7 +591,6 @@ class ZoClient:
 
     def _split_long_section(self, section: str) -> list[str]:
         """Split a section that's longer than max_length."""
-        import re
         heading_re = re.compile(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)')
 
         chunks = []
@@ -761,7 +633,6 @@ class ZoClient:
 
     def _fix_code_block_fences(self, chunks: list[str]) -> list[str]:
         """Close/reopen code blocks that were split across chunks."""
-        import re
         fence_re = re.compile(r'^(`{3,})(\w*)', re.MULTILINE)
 
         in_code = False
