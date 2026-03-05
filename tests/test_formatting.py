@@ -202,6 +202,39 @@ class TestChunking:
         chunks = client.chunk_response(text)
         assert len(chunks) >= 2
 
+    def test_code_block_split_gets_fences(self):
+        """Code blocks split across chunks get proper closing/opening fences."""
+        client = make_client()
+        client.max_length = 80
+        text = "Intro paragraph.\n\n```bash\nline1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n```\n\nAfter the code."
+        chunks = client.chunk_response(text)
+        for chunk in chunks:
+            raw = chunk.lstrip("\u200b\n")
+            opens = raw.count("```bash") + raw.count("```\n") - raw.count("````")
+            closes = raw.count("\n```") + (1 if raw.endswith("```") and not raw.endswith("````") else 0)
+            fence_count = len([l for l in raw.split("\n") if l.strip().startswith("```")])
+            assert fence_count % 2 == 0, f"Unbalanced fences in chunk: {raw[:80]}..."
+
+    def test_code_block_language_preserved(self):
+        """When a code block is split, the language tag is preserved on continuation."""
+        client = make_client()
+        client.max_length = 60
+        text = "```python\n" + "x = 1\n" * 20 + "```"
+        chunks = client.chunk_response(text)
+        for chunk in chunks:
+            raw = chunk.lstrip("\u200b\n")
+            if raw.startswith("```"):
+                assert raw.startswith("```python"), f"Language tag lost: {raw[:40]}"
+
+    def test_short_code_block_no_extra_fences(self):
+        """A code block that fits in one chunk should not get extra fences."""
+        client = make_client()
+        client.max_length = 200
+        text = "```bash\necho hello\n```"
+        chunks = client.chunk_response(text)
+        assert len(chunks) == 1
+        assert chunks[0].count("```") == 2
+
     def test_very_long_word_still_fits(self):
         client = make_client()
         client.max_length = 50

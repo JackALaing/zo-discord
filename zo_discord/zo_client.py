@@ -562,6 +562,9 @@ class ZoClient:
             if chunk:
                 safe_chunks.append(chunk)
 
+        # Fix code blocks that got split across chunks
+        safe_chunks = self._fix_code_block_fences(safe_chunks)
+
         # Add a blank-line spacer at the start of continuation chunks so
         # Discord's inter-message gap looks like a paragraph break.
         # Discord trims leading whitespace, but a zero-width space line works.
@@ -755,3 +758,35 @@ class ZoClient:
         if current:
             chunks.append(current)
         return chunks
+
+    def _fix_code_block_fences(self, chunks: list[str]) -> list[str]:
+        """Close/reopen code blocks that were split across chunks."""
+        import re
+        fence_re = re.compile(r'^(`{3,})(\w*)', re.MULTILINE)
+
+        in_code = False
+        lang = ""
+        fence_char_count = 3
+
+        fixed = []
+        for chunk in chunks:
+            if in_code:
+                chunk = f"```{lang}\n" + chunk
+
+            fences = fence_re.findall(chunk)
+            for ticks, fence_lang in fences:
+                if not in_code:
+                    in_code = True
+                    lang = fence_lang
+                    fence_char_count = len(ticks)
+                else:
+                    if len(ticks) >= fence_char_count:
+                        in_code = False
+                        lang = ""
+
+            if in_code:
+                chunk = chunk + "\n```"
+
+            fixed.append(chunk)
+
+        return fixed
