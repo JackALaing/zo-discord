@@ -399,7 +399,7 @@ class ZoDiscordBot(commands.Bot):
         if message.author.bot:
             return
 
-        if message.type != discord.MessageType.default:
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
 
         allowed_users = self.config.get("allowed_users", [])
@@ -1047,6 +1047,18 @@ class ZoDiscordBot(commands.Bot):
             except asyncio.TimeoutError:
                 pass
 
+    # ─── Helpers ───────────────────────────────────────────────────────────
+
+    async def resolve_thread(self, thread_id: str) -> discord.Thread | None:
+        """Get a thread by ID, falling back to API if not in cache."""
+        thread = self.get_channel(int(thread_id))
+        if thread is None:
+            try:
+                thread = await self.fetch_channel(int(thread_id))
+            except (discord.NotFound, discord.Forbidden):
+                return None
+        return thread if isinstance(thread, discord.Thread) else None
+
     # ─── HTTP Server ──────────────────────────────────────────────────────
 
     async def start_http_server(self):
@@ -1220,7 +1232,7 @@ class ZoDiscordBot(commands.Bot):
             data = await request.json()
             new_name = data["name"][:100]
 
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found"}, status=404)
 
@@ -1271,7 +1283,7 @@ class ZoDiscordBot(commands.Bot):
             if not buttons:
                 return web.json_response({"error": "No buttons specified"}, status=400)
 
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found"}, status=404)
 
@@ -1309,7 +1321,7 @@ class ZoDiscordBot(commands.Bot):
             if file_path.stat().st_size > 25 * 1024 * 1024:
                 return web.json_response({"error": "File too large (max 25MB)"}, status=400)
 
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found"}, status=404)
 
@@ -1371,7 +1383,7 @@ class ZoDiscordBot(commands.Bot):
             if data.get("footer"):
                 embed.set_footer(text=data["footer"])
 
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found"}, status=404)
 
@@ -1497,7 +1509,7 @@ class ZoDiscordBot(commands.Bot):
             status = data.get("status")
             if status == "complete":
                 try:
-                    thread = self.get_channel(int(thread_id))
+                    thread = await self.resolve_thread(thread_id)
                     if thread:
                         await set_watched(thread_id, False)
                         await thread.edit(archived=True)
@@ -1508,7 +1520,7 @@ class ZoDiscordBot(commands.Bot):
             if status not in STATUS_EMOJI:
                 return web.json_response({"error": f"Invalid status. Valid: {list(STATUS_EMOJI.keys()) + ['complete']}"}, status=400)
 
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found in Discord"}, status=404)
 
@@ -1542,7 +1554,7 @@ class ZoDiscordBot(commands.Bot):
                     logger.info(f"Queued rename '{name}' for conv {conv_id}")
                     return web.json_response({"success": True, "queued": True, "name": name})
                 thread_id = mapping["thread_id"]
-                thread = self.get_channel(int(thread_id))
+                thread = await self.resolve_thread(thread_id)
                 if not thread:
                     return web.json_response({"error": "Thread not found in Discord"}, status=404)
                 current_status = await get_thread_status(thread_id)
@@ -1560,7 +1572,7 @@ class ZoDiscordBot(commands.Bot):
                 return web.json_response({"error": f"No thread found for conversation {conv_id}"}, status=404)
 
             thread_id = mapping["thread_id"]
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found in Discord"}, status=404)
 
@@ -1740,7 +1752,7 @@ class ZoDiscordBot(commands.Bot):
             if not buttons:
                 return web.json_response({"error": "No buttons specified"}, status=400)
 
-            thread = self.get_channel(int(thread_id))
+            thread = await self.resolve_thread(thread_id)
             if not thread:
                 return web.json_response({"error": "Thread not found"}, status=404)
 
