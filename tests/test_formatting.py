@@ -34,9 +34,15 @@ def mock_env_and_config(tmp_path):
     config_path = config_dir / "config.json"
     config_path.write_text(json.dumps(MOCK_CONFIG))
 
+    # Reset config cache between tests
+    import zo_discord.zo_client as zc
+    zc._config_cache = None
+    zc._config_cache_time = 0.0
+
     with patch("zo_discord.PROJECT_ROOT", tmp_path), \
+         patch("zo_discord.zo_client.CONFIG_PATH", config_path), \
          patch.dict(os.environ, {"DISCORD_ZO_API_KEY": "test-key"}):
-        yield
+        yield tmp_path
 
 
 def make_client():
@@ -306,46 +312,90 @@ class TestThreadTitle:
         assert result == "New conversation"
 
 
-# ── extract_model_prefix / extract_persona_prefix ─────────────────────
+# ── extract_overrides ─────────────────────────────────────────────────
 
 
 @pytest.mark.skipif(not HAS_DISCORD, reason="py-cord not installed")
-class TestPrefixExtraction:
-    def test_model_alias_extracted(self):
-        from zo_discord.bot import ZoDiscordBot
-        with patch.object(ZoDiscordBot, '__init__', lambda self: None):
-            bot = ZoDiscordBot.__new__(ZoDiscordBot)
-            bot.extract_model_prefix = ZoDiscordBot.extract_model_prefix.__get__(bot)
-            model_id, text = bot.extract_model_prefix("/opus explain this code")
-            assert model_id == "byok:test-opus-id"
-            assert text == "explain this code"
+class TestExtractOverrides:
+    """Test the unified extract_overrides method that replaced
+    extract_model_prefix and extract_persona_prefix."""
 
-    def test_unknown_prefix_not_extracted(self):
+    def _make_bot(self):
         from zo_discord.bot import ZoDiscordBot
         with patch.object(ZoDiscordBot, '__init__', lambda self: None):
             bot = ZoDiscordBot.__new__(ZoDiscordBot)
-            bot.extract_model_prefix = ZoDiscordBot.extract_model_prefix.__get__(bot)
-            model_id, text = bot.extract_model_prefix("/unknown do something")
-            assert model_id is None
-            assert text == "/unknown do something"
+            bot.extract_overrides = ZoDiscordBot.extract_overrides.__get__(bot)
+            return bot
+
+    def test_model_alias_only(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("/opus explain this code")
+        assert model == "byok:test-opus-id"
+        assert persona is None
+        assert text == "explain this code"
+
+    def test_persona_alias_only(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("@pirate tell me about the weather")
+        assert model is None
+        assert persona == "per_test_pirate"
+        assert text == "tell me about the weather"
+
+    def test_model_then_persona(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("/opus @pirate hello")
+        assert model == "byok:test-opus-id"
+        assert persona == "per_test_pirate"
+        assert text == "hello"
+
+    def test_persona_then_model(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("@pirate /opus hello")
+        assert model == "byok:test-opus-id"
+        assert persona == "per_test_pirate"
+        assert text == "hello"
+
+    def test_unknown_model_not_extracted(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("/unknown do something")
+        assert model is None
+        assert persona is None
+        assert text == "/unknown do something"
+
+    def test_unknown_persona_not_extracted(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("@nobody hello there")
+        assert model is None
+        assert persona is None
+        assert text == "@nobody hello there"
 
     def test_no_prefix(self):
-        from zo_discord.bot import ZoDiscordBot
-        with patch.object(ZoDiscordBot, '__init__', lambda self: None):
-            bot = ZoDiscordBot.__new__(ZoDiscordBot)
-            bot.extract_model_prefix = ZoDiscordBot.extract_model_prefix.__get__(bot)
-            model_id, text = bot.extract_model_prefix("just a normal message")
-            assert model_id is None
-            assert text == "just a normal message"
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("just a normal message")
+        assert model is None
+        assert persona is None
+        assert text == "just a normal message"
 
-    def test_persona_alias_extracted(self):
-        from zo_discord.bot import ZoDiscordBot
-        with patch.object(ZoDiscordBot, '__init__', lambda self: None):
-            bot = ZoDiscordBot.__new__(ZoDiscordBot)
-            bot.extract_persona_prefix = ZoDiscordBot.extract_persona_prefix.__get__(bot)
-            persona_id, text = bot.extract_persona_prefix("@pirate tell me about the weather")
-            assert persona_id == "per_test_pirate"
-            assert text == "tell me about the weather"
+    def test_empty_message(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("")
+        assert model is None
+        assert persona is None
+        assert text == ""
+
+    def test_model_only_no_remaining_text(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("/opus")
+        assert model == "byok:test-opus-id"
+        assert persona is None
+        assert text == ""
+
+    def test_second_alias(self):
+        bot = self._make_bot()
+        model, persona, text = bot.extract_overrides("/sonnet @formal write something")
+        assert model == "byok:test-sonnet-id"
+        assert persona == "per_test_formal"
+        assert text == "write something"
 
 
 # ── status prefix helpers ─────────────────────────────────────────────
@@ -374,3 +424,109 @@ class TestStatusPrefix:
     def test_strip_no_prefix(self):
         from zo_discord.utils import strip_status_prefix
         assert strip_status_prefix("Normal Thread") == "Normal Thread"
+
+
+# ── config TTL cache ─────────────────────────────────────────────────
+
+
+class TestConfigCache:
+    """Test that load_config uses a TTL cache and picks up changes."""
+
+    def test_cache_returns_same_object_within_ttl(self):
+        import zo_discord.zo_client as zc
+        config1 = zc.load_config()
+        config2 = zc.load_config()
+        assert config1 is config2
+
+    def test_cache_refreshes_after_ttl(self):
+        import time
+        import zo_discord.zo_client as zc
+        config1 = zc.load_config()
+        # Manually expire the cache
+        zc._config_cache_time = time.monotonic() - zc._CONFIG_TTL - 1
+        config2 = zc.load_config()
+        # After expiry, should reload (new dict object)
+        assert config1 is not config2
+        # But content is the same
+        assert config1 == config2
+
+    def test_cache_picks_up_file_changes(self, mock_env_and_config):
+        import time
+        import zo_discord.zo_client as zc
+        fixture_tmp = mock_env_and_config
+
+        config1 = zc.load_config()
+        assert config1.get("model") is None
+
+        # Write a modified config to the fixture's config path
+        new_config = {**MOCK_CONFIG, "model": "changed-model"}
+        config_path = fixture_tmp / "config" / "config.json"
+        config_path.write_text(json.dumps(new_config))
+
+        # Expire the cache
+        zc._config_cache_time = time.monotonic() - zc._CONFIG_TTL - 1
+        config2 = zc.load_config()
+        assert config2["model"] == "changed-model"
+
+
+# ── session pool error detection ─────────────────────────────────────
+
+
+class TestSessionPoolError:
+    def test_detects_sessions_busy(self):
+        from zo_discord.zo_client import _is_session_pool_error
+        assert _is_session_pool_error("All sessions are busy, please try again later")
+
+    def test_detects_cannot_evict(self):
+        from zo_discord.zo_client import _is_session_pool_error
+        assert _is_session_pool_error("Cannot evict any session from the pool")
+
+    def test_case_insensitive(self):
+        from zo_discord.zo_client import _is_session_pool_error
+        assert _is_session_pool_error("SESSIONS ARE BUSY")
+
+    def test_normal_error_not_detected(self):
+        from zo_discord.zo_client import _is_session_pool_error
+        assert not _is_session_pool_error("Internal server error")
+        assert not _is_session_pool_error("Conversation not found")
+        assert not _is_session_pool_error("")
+
+
+# ── sentence counting ────────────────────────────────────────────────
+
+
+class TestSentenceCounting:
+    def test_basic_sentences(self):
+        from zo_discord.zo_client import _count_sentences
+        assert _count_sentences("Hello. World. Done.") == 3
+
+    def test_exclamation_and_question(self):
+        from zo_discord.zo_client import _count_sentences
+        assert _count_sentences("What? Yes! Okay.") == 3
+
+    def test_no_sentences(self):
+        from zo_discord.zo_client import _count_sentences
+        assert _count_sentences("no punctuation here") == 0
+
+    def test_sentence_at_end(self):
+        from zo_discord.zo_client import _count_sentences
+        assert _count_sentences("One sentence.") == 1
+
+
+# ── StreamResult dataclass ───────────────────────────────────────────
+
+
+class TestStreamResult:
+    def test_fields(self):
+        from zo_discord.zo_client import StreamResult
+        r = StreamResult(output="hello", conv_id="con_123", interrupted=False, received_events=True)
+        assert r.output == "hello"
+        assert r.conv_id == "con_123"
+        assert r.interrupted is False
+        assert r.received_events is True
+
+    def test_interrupted_stream(self):
+        from zo_discord.zo_client import StreamResult
+        r = StreamResult(output="", conv_id="con_456", interrupted=True, received_events=True)
+        assert r.interrupted is True
+        assert r.output == ""
