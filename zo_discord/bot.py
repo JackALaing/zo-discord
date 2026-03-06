@@ -182,6 +182,7 @@ class ButtonCallbackView(ui.View):
                             response, new_conv_id = await self.bot._retry_empty_response(
                                 self.thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
                                 interrupted=result.interrupted,
+                                received_events=result.received_events,
                             )
 
                         chunks = self.bot.zo.chunk_response(response)
@@ -527,10 +528,11 @@ class ZoDiscordBot(commands.Bot):
                     await update_thread_name(thread_id, rename[:100])
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted})")
+                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, conv_id = await self._retry_empty_response(
                     thread_id, conv_id, thread, on_thinking, on_conv_id,
                     interrupted=result.interrupted,
+                    received_events=result.received_events,
                 )
 
             chunks = self.zo.chunk_response(response)
@@ -714,10 +716,11 @@ class ZoDiscordBot(commands.Bot):
             await update_activity(thread_id)
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted})")
+                logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, new_conv_id = await self._retry_empty_response(
                     thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
                     interrupted=result.interrupted,
+                    received_events=result.received_events,
                 )
 
             chunks = self.zo.chunk_response(response)
@@ -824,6 +827,7 @@ class ZoDiscordBot(commands.Bot):
         on_thinking,
         on_conv_id,
         interrupted: bool = False,
+        received_events: bool = False,
     ) -> tuple[str, str]:
         """Recover from an empty response using a two-phase strategy.
 
@@ -853,6 +857,12 @@ class ZoDiscordBot(commands.Bot):
 
                 logger.info(f"Agent is idle but output still empty for conv {conv_id}, proceeding to phase 2")
             else:
+                # wait_for_idle failed (auth error or timeout). If we received
+                # events (agent was actively working) but got no output, the
+                # stream was likely killed by a manual stop, not a network glitch.
+                if received_events:
+                    logger.info(f"Stream interrupted with events but no output for conv {conv_id}, skipping retry")
+                    return "", conv_id
                 logger.error(f"Timed out waiting for conv {conv_id} to become idle")
                 return "", conv_id
 
@@ -1688,10 +1698,11 @@ class ZoDiscordBot(commands.Bot):
             response, new_conv_id = result.output, result.conv_id
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for new thread {thread.id} (interrupted={result.interrupted})")
+                logger.warning(f"Empty response for new thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, new_conv_id = await self._retry_empty_response(
                     thread_id_str, new_conv_id, thread, on_thinking, on_conv_id,
                     interrupted=result.interrupted,
+                    received_events=result.received_events,
                 )
 
             chunks = self.zo.chunk_response(response)

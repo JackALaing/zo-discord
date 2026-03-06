@@ -242,6 +242,12 @@ class ZoClient:
                                     elif current_event_type == "PartEndEvent":
                                         in_text_part = False
 
+                                    elif current_event_type == "SSEErrorEvent":
+                                        error_msg = event.get("message", "")
+                                        logger.warning(f"SSE error event for conv {conv_id}: {error_msg}")
+                                        stream_interrupted = True
+                                        break
+
                                     elif current_event_type == "End":
                                         final_output = event.get("data", {}).get("output", "")
                                         stream_done = True
@@ -311,6 +317,9 @@ class ZoClient:
                         f"{self.BASE_URL}/conversations/{conversation_id}",
                         headers=headers,
                     ) as resp:
+                        if resp.status in (401, 403):
+                            logger.warning(f"Conv state endpoint returned {resp.status} for {conversation_id}")
+                            return None
                         if resp.status != 200:
                             error_text = await resp.text()
                             logger.warning(f"Failed to get conv {conversation_id} state: {resp.status} {error_text}")
