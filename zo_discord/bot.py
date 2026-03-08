@@ -181,8 +181,6 @@ class ButtonCallbackView(ui.View):
                             logger.warning(f"Empty response for button callback conv {conv_id} (interrupted={result.interrupted})")
                             response, new_conv_id = await self.bot._retry_empty_response(
                                 self.thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
-                                interrupted=result.interrupted,
-                                received_events=result.received_events,
                             )
 
                         chunks = self.bot.zo.chunk_response(response)
@@ -531,8 +529,6 @@ class ZoDiscordBot(commands.Bot):
                 logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, conv_id = await self._retry_empty_response(
                     thread_id, conv_id, thread, on_thinking, on_conv_id,
-                    interrupted=result.interrupted,
-                    received_events=result.received_events,
                 )
 
             chunks = self.zo.chunk_response(response)
@@ -719,8 +715,6 @@ class ZoDiscordBot(commands.Bot):
                 logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, new_conv_id = await self._retry_empty_response(
                     thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
-                    interrupted=result.interrupted,
-                    received_events=result.received_events,
                 )
 
             chunks = self.zo.chunk_response(response)
@@ -746,7 +740,7 @@ class ZoDiscordBot(commands.Bot):
             logger.info(f"Thread {thread_id} request was cancelled")
         except Exception as e:
             logger.error(f"Error in thread: {e}", exc_info=True)
-            # Try to recover the response from conversation history.
+            # Try to recover by sending a continuation message.
             # The Zo agent may have responded, but the Discord connection
             # dropped before we could relay it (e.g. "Connection closed").
             recovery_conv_id = (self._inflight.get(thread_id, {}).get("conv_id") or conv_id)
@@ -760,10 +754,21 @@ class ZoDiscordBot(commands.Bot):
                             break
                         logger.info(f"Waiting {wait_secs}s for Discord reconnect...")
                         await asyncio.sleep(wait_secs)
-                    idle_result = await self.zo.wait_for_idle(recovery_conv_id, max_wait=60)
-                    if idle_result and idle_result.output and idle_result.output.strip():
-                        logger.info(f"Recovered {len(idle_result.output)} chars from conv {recovery_conv_id}")
-                        chunks = self.zo.chunk_response(idle_result.output)
+                    recovery_input = (
+                        "Your previous response was empty. If you were interrupted, "
+                        "please continue where you left off. If you finished the work, "
+                        "please respond with your results."
+                    )
+                    recovery_result = await self.zo.ask_stream(
+                        recovery_input,
+                        conversation_id=recovery_conv_id,
+                    )
+                    if recovery_result.conv_id != recovery_conv_id:
+                        await update_conversation_id(thread_id, recovery_result.conv_id)
+                        recovery_conv_id = recovery_result.conv_id
+                    if recovery_result.output and recovery_result.output.strip():
+                        logger.info(f"Recovered {len(recovery_result.output)} chars from conv {recovery_conv_id}")
+                        chunks = self.zo.chunk_response(recovery_result.output)
                         chunks = [c for c in chunks if c.strip()]
                         for i, chunk in enumerate(chunks):
                             kwargs = {"content": chunk}
@@ -826,54 +831,22 @@ class ZoDiscordBot(commands.Bot):
         thread: discord.Thread,
         on_thinking,
         on_conv_id,
-        interrupted: bool = False,
-        received_events: bool = False,
     ) -> tuple[str, str]:
-        """Recover from an empty response using a two-phase strategy.
+        """Recover from an empty or interrupted response.
 
-        Phase 1 (interrupted stream): The agent may still be working. Poll with
-        wait_for_idle — if the API returns 409, the agent is busy and we just
-        wait patiently. This avoids sending "please continue" which would
-        interrupt a working agent. wait_for_idle sends a "please continue"
-        probe only after the 409s stop, so we may get a real response back.
-
-        Phase 2 (confirmed idle, still empty): The agent genuinely finished
-        with no output. Send "please continue" (bundling any queued user
-        messages) via streaming to get a real response.
+        Sends a continuation message (bundling any queued user messages)
+        via streaming to nudge the agent into producing output.
         """
-        # Phase 1: If the stream was interrupted, wait for the agent to finish
-        if interrupted:
-            logger.info(f"Stream was interrupted for conv {conv_id}, waiting for agent to finish")
-            idle_result = await self.zo.wait_for_idle(conv_id)
-
-            if idle_result is not None:
-                if idle_result.conv_id != conv_id:
-                    await update_conversation_id(thread_id, idle_result.conv_id)
-                    conv_id = idle_result.conv_id
-
-                if idle_result.output and idle_result.output.strip():
-                    logger.info(f"Got response from wait_for_idle for conv {conv_id}")
-                    return idle_result.output, conv_id
-
-                logger.info(f"Agent is idle but output still empty for conv {conv_id}, proceeding to phase 2")
-            else:
-                # wait_for_idle failed (auth error or timeout). If we received
-                # events (agent was actively working) but got no output, the
-                # stream was likely killed by a manual stop, not a network glitch.
-                if received_events:
-                    logger.info(f"Stream interrupted with events but no output for conv {conv_id}, skipping retry")
-                    return "", conv_id
-                logger.error(f"Timed out waiting for conv {conv_id} to become idle")
-                return "", conv_id
-
-        # Phase 2: Agent is idle but produced no output. Send "please continue"
-        # with any queued user messages.
         queued_parts = self._collect_queued_text(thread_id)
         if queued_parts:
             retry_input = " ".join(queued_parts)
             logger.info(f"Sending continue with {len(queued_parts)} queued message(s) for conv {conv_id}")
         else:
-            retry_input = "Please continue."
+            retry_input = (
+                "Your previous response was empty. If you were interrupted, "
+                "please continue where you left off. If you finished the work, "
+                "please respond with your results."
+            )
 
         retry_delays = [15, 30, 60]
         for attempt, delay in enumerate(retry_delays, 1):
@@ -894,14 +867,6 @@ class ZoDiscordBot(commands.Bot):
                 if result.output and result.output.strip():
                     logger.info(f"Continue attempt {attempt} succeeded for conv {conv_id}")
                     return result.output, conv_id
-
-                if result.interrupted:
-                    logger.info(f"Continue attempt {attempt} was also interrupted, waiting for idle")
-                    idle_result = await self.zo.wait_for_idle(conv_id)
-                    if idle_result and idle_result.output and idle_result.output.strip():
-                        if idle_result.conv_id != conv_id:
-                            await update_conversation_id(thread_id, idle_result.conv_id)
-                        return idle_result.output, idle_result.conv_id
             except Exception as e:
                 logger.error(f"Continue attempt {attempt} failed for conv {conv_id}: {e}")
 
@@ -1701,8 +1666,6 @@ class ZoDiscordBot(commands.Bot):
                 logger.warning(f"Empty response for new thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, new_conv_id = await self._retry_empty_response(
                     thread_id_str, new_conv_id, thread, on_thinking, on_conv_id,
-                    interrupted=result.interrupted,
-                    received_events=result.received_events,
                 )
 
             chunks = self.zo.chunk_response(response)
