@@ -957,7 +957,10 @@ class ZoDiscordBot(commands.Bot):
             sections.append(
                 "## Discord Tools\n"
                 "For more tools to interact with Discord, like spawning new threads and "
-                "presenting the user with button forms, see the zo-discord skill."
+                "presenting the user with button forms, see the zo-discord skill.\n\n"
+                "When you generate files (images, documents, etc.), send them into the thread with:\n"
+                '`zo-discord files /path/to/file.png "Optional caption"`\n\n'
+                "Run `zo-discord help` for the full command list."
             )
 
         else:
@@ -969,7 +972,9 @@ class ZoDiscordBot(commands.Bot):
                     "This message is from Discord (channel: " + channel_mention + "; "
                     'thread: "' + clean_name + '"). '
                     "Reply normally. "
-                    'If the topic has shifted from the thread name, rename first: `zo-discord rename "New Title"`'
+                    'If the topic has shifted from the thread name, rename first: `zo-discord rename "New Title"`\n'
+                    'Send generated files: `zo-discord files /path/to/file "caption"` | '
+                    "Full CLI help: `zo-discord help`"
                 )
 
         return "\n\n".join(sections), file_paths
@@ -1056,6 +1061,7 @@ class ZoDiscordBot(commands.Bot):
         self.http_app.router.add_delete("/channels/{channel_id}/config", self.handle_delete_channel_config)
         self.http_app.router.add_post("/threads/{thread_id}/status", self.handle_set_status)
         self.http_app.router.add_post("/conversations/{conv_id}/action", self.handle_conversation_action)
+        self.http_app.router.add_post("/conversations/{conv_id}/files", self.handle_conversation_files)
         self.http_app.router.add_post("/conversations/{conv_id}/new-thread", self.handle_new_thread)
 
         port = self.config.get("notification_port", 8787)
@@ -1578,6 +1584,53 @@ class ZoDiscordBot(commands.Bot):
 
         except Exception as e:
             logger.error(f"Conversation action error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_conversation_files(self, request: web.Request) -> web.Response:
+        """Send a file attachment to the thread for a conversation.
+
+        POST /conversations/{conv_id}/files
+        {
+            "file_path": "/home/workspace/Images/generated.png",
+            "message": "Optional text"
+        }
+        """
+        conv_id = request.match_info["conv_id"]
+        try:
+            data = await request.json()
+            file_path = Path(data.get("file_path", ""))
+            message = data.get("message", "")
+
+            if not file_path or not str(file_path).strip():
+                return web.json_response({"error": "file_path is required"}, status=400)
+
+            if not file_path.exists():
+                return web.json_response({"error": f"File not found: {file_path}"}, status=404)
+
+            if file_path.stat().st_size > 25 * 1024 * 1024:
+                return web.json_response({"error": "File too large (max 25MB)"}, status=400)
+
+            mapping = await get_mapping_by_conversation(conv_id)
+            if not mapping:
+                return web.json_response({"error": f"No thread found for conversation {conv_id}"}, status=404)
+
+            thread_id = mapping["thread_id"]
+            thread = await self.resolve_thread(thread_id)
+            if not thread:
+                return web.json_response({"error": "Thread not found in Discord"}, status=404)
+
+            msg = await thread.send(
+                content=message or None,
+                file=discord.File(str(file_path))
+            )
+
+            return web.json_response({
+                "success": True,
+                "message_id": str(msg.id)
+            })
+
+        except Exception as e:
+            logger.error(f"Conversation file send error: {e}", exc_info=True)
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_new_thread(self, request: web.Request) -> web.Response:

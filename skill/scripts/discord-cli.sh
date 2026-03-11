@@ -5,19 +5,45 @@
 # Usage: zo-discord <command> [args...]
 #
 # Commands:
-#   rename <title>                          — Rename the thread
-#   error                                   — Set status to error
+#   rename <title>                              — Rename the thread
+#   error                                       — Set status to error
 #   notify <title> <content> --channel-name NAME — Post content to a new thread
 #   notify <title> --file <path> --channel-name NAME — Post file contents to a new thread
-#   new-thread <title> <prompt> [--channel-name NAME] — Spawn a new thread with a fresh Zo session
+#   buttons "Prompt?" "Label:style" ...         — Send interactive buttons
+#   buttons "Prompt?" --preset yes_no           — Send preset buttons (yes_no, approve_reject)
+#   files <path> [message]                      — Send a file attachment to the thread
+#   new-thread <title> <prompt> [--channel-name NAME] — Spawn a new thread
 #
 # Channel targeting: use --channel-name <name> (e.g. "general", "pulse") or --channel <id>
 
 set -euo pipefail
 
 API="http://localhost:8787"
-CMD="${1:?Usage: zo-discord <command> [args...]}"
+CMD="${1:?Usage: zo-discord <command> [args...] (try 'zo-discord help')}"
 shift
+
+# Help — no conversation ID needed
+if [[ "$CMD" == "help" || "$CMD" == "--help" || "$CMD" == "-h" ]]; then
+  cat <<'HELP'
+zo-discord — control Discord threads from Zo conversations
+
+Usage: zo-discord <command> [args...]
+
+Commands:
+  rename <title>                                Rename the thread
+  error                                         Set status to error
+  notify <title> <content> --channel-name NAME  Post content to a new thread
+  notify <title> --file <path> --channel-name NAME  Post file contents to a new thread
+  buttons "Prompt?" "Label:style" ...           Send interactive buttons
+  buttons "Prompt?" --preset yes_no             Send preset buttons (yes_no, approve_reject)
+  files <path> [message]                        Send a file attachment (max 25MB)
+  new-thread <title> <prompt> [--channel-name NAME]  Spawn a new thread
+
+Channel targeting: use --channel-name <name> or --channel <id>
+Conv ID: auto-detected from workspace path, ZO_CONVERSATION_ID, or --conv-id <id>
+HELP
+  exit 0
+fi
 
 # Auto-detect conversation ID
 CONV_ID=""
@@ -153,6 +179,21 @@ print(json.dumps(d))
       -H "Content-Type: application/json" \
       -d "$PAYLOAD"
     ;;
+  files)
+    FILEPATH="${1:?Usage: zo-discord files <path> [message]}"
+    shift
+    MESSAGE="${1:-}"
+    PAYLOAD=$(python3 -c "
+import json, sys
+d = {'file_path': sys.argv[1]}
+if sys.argv[2]:
+    d['message'] = sys.argv[2]
+print(json.dumps(d))
+" "$FILEPATH" "$MESSAGE")
+    curl -sS -X POST "$API/conversations/$CONV_ID/files" \
+      -H "Content-Type: application/json" \
+      -d "$PAYLOAD"
+    ;;
   new-thread)
     TITLE="${1:?Usage: zo-discord new-thread <title> <prompt> [--channel-name NAME]}"
     shift
@@ -183,7 +224,7 @@ print(json.dumps(d))
     ;;
   *)
     echo "Unknown command: $CMD" >&2
-    echo "Commands: rename, error, notify, buttons, new-thread" >&2
+    echo "Commands: rename, error, notify, buttons, files, new-thread" >&2
     exit 1
     ;;
 esac

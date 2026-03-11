@@ -25,6 +25,7 @@ zo-discord <command> [args]
 | `zo-discord notify "Title" --file /tmp/out.md --channel-name pulse` | Post file contents to a new thread |
 | `zo-discord buttons "Prompt?" "Label:style" ...` | Send interactive buttons (user's click is injected back) |
 | `zo-discord buttons "Prompt?" --preset yes_no` | Send preset buttons (presets: `yes_no`, `approve_reject`) |
+| `zo-discord files /path/to/file "caption"` | Send a file attachment to the thread (max 25MB) |
 | `zo-discord new-thread "Title" "prompt"` | Spawn a new thread with a fresh Zo session |
 
 Channel targeting: use `--channel-name <name>` (e.g. `general`, `pulse`) or `--channel <id>`. Prefer `--channel-name` — no need to look up IDs.
