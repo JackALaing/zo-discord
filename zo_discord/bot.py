@@ -1123,6 +1123,23 @@ class ZoDiscordBot(commands.Bot):
             content = data.get("content", "")
             conversation_id = data.get("conversation_id", "")
 
+            # Reject if this conversation already has a linked Discord thread
+            if conversation_id:
+                existing = await get_mapping_by_conversation(conversation_id)
+                if existing:
+                    thread_id = existing.get("thread_id", "unknown")
+                    thread_name = existing.get("thread_name", "")
+                    return web.json_response({
+                        "error": (
+                            f"Conversation {conversation_id} already has a linked Discord thread "
+                            f"(thread_id: {thread_id}, name: '{thread_name}'). "
+                            f"You are already in that thread — your normal text responses will appear there. "
+                            f"Do NOT use zo-discord notify; just respond directly."
+                        ),
+                        "existing_thread_id": thread_id,
+                        "conversation_id": conversation_id
+                    }, status=409)
+
             if channel_name and not channel_id:
                 channel = self.resolve_channel_by_name(channel_name)
                 if not channel:

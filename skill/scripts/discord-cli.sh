@@ -125,9 +125,17 @@ else:
     d['channel_id'] = channel
 print(json.dumps(d))
 " "$TITLE" "$CHANNEL" "$CHANNEL_NAME" "$CONTENT" "$FILE" "$CONV_ID")
-    curl -sS -X POST "$API/notify" \
+    RESPONSE=$(curl -sS -w "\n%{http_code}" -X POST "$API/notify" \
       -H "Content-Type: application/json" \
-      -d "$PAYLOAD"
+      -d "$PAYLOAD")
+    HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+    BODY=$(echo "$RESPONSE" | sed '$d')
+    if [[ "$HTTP_CODE" == "409" ]]; then
+      ERROR_MSG=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','Conversation already has a linked thread'))" 2>/dev/null || echo "Conversation already has a linked Discord thread. Do NOT use zo-discord notify; just respond directly.")
+      echo "REJECTED: $ERROR_MSG" >&2
+      exit 1
+    fi
+    echo "$BODY"
     ;;
   buttons)
     PROMPT=""
