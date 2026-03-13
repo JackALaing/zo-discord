@@ -210,6 +210,7 @@ class ZoDiscordBot(commands.Bot):
         intents.guilds = True
         intents.members = True
         intents.reactions = True
+        intents.typing = True
 
         super().__init__(
             intents=intents,
@@ -227,6 +228,15 @@ class ZoDiscordBot(commands.Bot):
         self._bundled_prefixes = {}  # message.id -> str, for passing context to handle_thread_message
         self._thinking_mode = self.config.get("thinking_mode", "streaming")
         self._auto_archive_override = self.config.get("auto_archive_override", True)
+
+        # Buffer state: groups rapid-fire messages before processing
+        self._buffer = {}          # channel/thread key -> list[discord.Message]
+        self._buffer_tasks = {}    # channel/thread key -> asyncio.Task (countdown)
+        self._buffer_typing = {}   # channel/thread key -> float (last on_typing timestamp)
+        self._buffer_paused = {}   # channel/thread key -> bool (paused by user typing)
+        self._buffer_remaining = {}  # channel/thread key -> float (seconds left when paused)
+        self._buffer_typing_tasks = {}  # channel/thread key -> asyncio.Task (typing indicator)
+        self._TYPING_TIMEOUT = 10.0  # seconds to wait after last on_typing before unpausing
 
         setup_commands(self)
 
@@ -263,6 +273,13 @@ class ZoDiscordBot(commands.Bot):
                 break
 
         return model_id, persona_id, remaining
+
+    async def get_buffer_seconds(self, channel_id: str) -> float:
+        """Get effective buffer_seconds for a channel (channel override > global config)."""
+        ch_config = await get_channel_config(channel_id)
+        if ch_config and ch_config.get("buffer_seconds") is not None:
+            return float(ch_config["buffer_seconds"])
+        return float(self.config.get("buffer_seconds", 0))
 
     async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None]:
         """Get the effective model and persona for a channel.
@@ -394,6 +411,168 @@ class ZoDiscordBot(commands.Bot):
         except Exception as e:
             logger.error(f"Thread watcher on_thread_update error: {e}")
 
+    def _buffer_key(self, message: discord.Message) -> str:
+        """Return a buffer key for grouping messages.
+
+        For threads: use the thread ID so follow-ups are batched.
+        For channels: use "channel:{channel_id}:{author_id}" so each user's
+        rapid-fire messages are grouped into one thread.
+        """
+        if isinstance(message.channel, discord.Thread):
+            return f"thread:{message.channel.id}"
+        return f"channel:{message.channel.id}:{message.author.id}"
+
+    async def _start_buffer_typing(self, key: str, channel):
+        """Start a typing indicator loop for the buffer countdown period."""
+        if key in self._buffer_typing_tasks:
+            return  # already running
+        stop = asyncio.Event()
+
+        async def _loop():
+            while not stop.is_set():
+                try:
+                    await channel.trigger_typing()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+
+        task = asyncio.create_task(_loop())
+        task._stop_event = stop
+        self._buffer_typing_tasks[key] = task
+
+    def _stop_buffer_typing(self, key: str):
+        """Stop the buffer typing indicator."""
+        task = self._buffer_typing_tasks.pop(key, None)
+        if task:
+            task._stop_event.set()
+            task.cancel()
+
+    async def _buffer_countdown(self, key: str, delay: float):
+        """Wait for the buffer delay, then flush. Supports pausing via _buffer_paused."""
+        remaining = delay
+        while remaining > 0:
+            if self._buffer_paused.get(key):
+                # Paused by user typing — store remaining time and wait
+                self._buffer_remaining[key] = remaining
+                self._stop_buffer_typing(key)
+                while self._buffer_paused.get(key):
+                    await asyncio.sleep(0.1)
+                remaining = self._buffer_remaining.pop(key, remaining)
+                # Resume typing indicator
+                msgs = self._buffer.get(key, [])
+                if msgs:
+                    await self._start_buffer_typing(key, msgs[0].channel)
+                continue
+            wait = min(remaining, 0.2)
+            await asyncio.sleep(wait)
+            remaining -= wait
+        await self._flush_buffer(key)
+
+    async def _flush_buffer(self, key: str):
+        """Flush buffered messages and dispatch to the appropriate handler."""
+        messages = self._buffer.pop(key, [])
+        self._buffer_tasks.pop(key, None)
+        self._buffer_typing.pop(key, None)
+        self._buffer_paused.pop(key, None)
+        self._buffer_remaining.pop(key, None)
+        self._stop_buffer_typing(key)
+
+        if not messages:
+            return
+
+        if key.startswith("thread:"):
+            if len(messages) == 1:
+                await self.handle_thread_message(messages[0])
+            else:
+                primary = messages[-1]
+                earlier_parts = []
+                for msg in messages[:-1]:
+                    earlier_parts.append(f"[{msg.author.display_name}]: {msg.content}")
+                self._bundled_prefixes[primary.id] = "\n".join(earlier_parts)
+                await self.handle_thread_message(primary)
+        elif key.startswith("channel:"):
+            if len(messages) == 1:
+                await self.handle_channel_message(messages[0])
+            else:
+                await self.handle_channel_message_batched(messages)
+
+    async def _add_to_buffer(self, message: discord.Message, buffer_seconds: float):
+        """Add a message to the buffer and reset the countdown timer."""
+        key = self._buffer_key(message)
+
+        # Pre-save attachments (CDN URLs expire)
+        if message.attachments:
+            channel_name = message.channel.name if hasattr(message.channel, 'name') else "unknown"
+            if isinstance(message.channel, discord.Thread) and message.channel.parent:
+                channel_name = message.channel.parent.name
+            att_dir = get_attachments_dir(channel_name)
+            saved = []
+            for att in message.attachments:
+                try:
+                    att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
+                    await att.save(att_path)
+                    saved.append(str(att_path))
+                except Exception as e:
+                    logger.error(f"Failed to save buffered attachment: {e}")
+            if saved:
+                message._presaved_attachments = saved
+
+        if key not in self._buffer:
+            self._buffer[key] = []
+        self._buffer[key].append(message)
+
+        # Cancel existing countdown and start a new one
+        existing_task = self._buffer_tasks.get(key)
+        if existing_task:
+            existing_task.cancel()
+            try:
+                await existing_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        # Ensure typing indicator is running
+        await self._start_buffer_typing(key, message.channel)
+
+        # Unpause if user just sent a message (they finished typing)
+        self._buffer_paused[key] = False
+
+        # Start new countdown
+        task = asyncio.create_task(self._buffer_countdown(key, buffer_seconds))
+        self._buffer_tasks[key] = task
+
+    async def on_typing(self, channel, user, when):
+        """Pause the buffer countdown while the user is typing."""
+        if user.bot:
+            return
+
+        # Determine which buffer keys this typing event could affect
+        possible_keys = []
+        if isinstance(channel, discord.Thread):
+            possible_keys.append(f"thread:{channel.id}")
+        elif isinstance(channel, discord.TextChannel):
+            possible_keys.append(f"channel:{channel.id}:{user.id}")
+
+        for key in possible_keys:
+            if key not in self._buffer or key not in self._buffer_tasks:
+                continue
+            # Mark as paused and record typing timestamp
+            self._buffer_typing[key] = asyncio.get_event_loop().time()
+            self._buffer_paused[key] = True
+            # Schedule unpause after typing timeout
+            asyncio.ensure_future(self._typing_timeout(key))
+
+    async def _typing_timeout(self, key: str):
+        """After TYPING_TIMEOUT seconds with no new on_typing event, unpause the buffer."""
+        await asyncio.sleep(self._TYPING_TIMEOUT)
+        last_typing = self._buffer_typing.get(key, 0)
+        elapsed = asyncio.get_event_loop().time() - last_typing
+        if elapsed >= self._TYPING_TIMEOUT - 0.1 and self._buffer_paused.get(key):
+            logger.info(f"Buffer typing timeout for {key}, unpausing")
+            self._buffer_paused[key] = False
+
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
@@ -405,6 +584,30 @@ class ZoDiscordBot(commands.Bot):
         if allowed_users and str(message.author.id) not in allowed_users:
             return
 
+        # For thread messages with an inflight request, bypass buffer and use existing queue
+        if isinstance(message.channel, discord.Thread):
+            thread_id = str(message.channel.id)
+            if self._inflight.get(thread_id):
+                await self.handle_thread_message(message)
+                return
+
+        # Determine buffer delay
+        if isinstance(message.channel, discord.Thread) and message.channel.parent:
+            channel_id = str(message.channel.parent.id)
+        elif isinstance(message.channel, discord.TextChannel):
+            channel_id = str(message.channel.id)
+        else:
+            channel_id = None
+
+        buffer_seconds = 0.0
+        if channel_id:
+            buffer_seconds = await self.get_buffer_seconds(channel_id)
+
+        if buffer_seconds > 0:
+            await self._add_to_buffer(message, buffer_seconds)
+            return
+
+        # No buffer — process immediately (original behavior)
         if isinstance(message.channel, discord.Thread):
             await self.handle_thread_message(message)
             return
@@ -559,6 +762,132 @@ class ZoDiscordBot(commands.Bot):
 
             # Drain queued messages (user may have sent follow-ups in the
             # thread while this channel-message turn was still running).
+            await self._drain_queue(thread_id)
+
+    async def handle_channel_message_batched(self, messages: list[discord.Message]):
+        """Handle multiple buffered channel messages as a single thread.
+
+        Creates a thread on the LAST message and combines all message texts.
+        Model/persona overrides are taken from the first message that has them.
+        """
+        last_msg = messages[-1]
+        channel = last_msg.channel
+        logger.info(f"Processing {len(messages)} buffered messages in #{channel.name} from {last_msg.author}")
+
+        # Combine text and collect overrides/attachments
+        combined_parts = []
+        effective_model = None
+        effective_persona = None
+        all_attachment_paths = []
+
+        for msg in messages:
+            model_override, persona_override, text = self.extract_overrides(msg.content)
+            if model_override and not effective_model:
+                effective_model = model_override
+            if persona_override and not effective_persona:
+                effective_persona = persona_override
+            combined_parts.append(text)
+
+            # Use pre-saved attachments from buffer or save now
+            att_paths = getattr(msg, "_presaved_attachments", None) or []
+            if not att_paths and msg.attachments:
+                att_dir = get_attachments_dir(channel.name)
+                for att in msg.attachments:
+                    try:
+                        att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
+                        await att.save(att_path)
+                        att_paths.append(str(att_path))
+                    except Exception as e:
+                        logger.error(f"Failed to save attachment: {e}")
+            all_attachment_paths.extend(att_paths)
+
+        user_text = "\n".join(combined_parts)
+
+        # Resolve channel defaults
+        channel_model, channel_persona = await self.resolve_channel_defaults(str(channel.id))
+        effective_model = effective_model or channel_model
+        config = load_config()
+        effective_persona = effective_persona or channel_persona or config.get("default_persona")
+
+        # Create thread on the last message
+        simple_title = self.zo.generate_thread_title_simple(user_text)
+        thread = await last_msg.create_thread(name=simple_title[:100])
+        thread_id = str(thread.id)
+
+        await save_mapping(
+            thread_id=thread_id,
+            conversation_id="",
+            channel_id=str(channel.id),
+            guild_id=str(last_msg.guild.id),
+            thread_name=simple_title[:100]
+        )
+
+        on_thinking = self.make_on_thinking(thread)
+
+        async def on_conv_id(cid: str):
+            await update_conversation_id(thread_id, cid)
+            if thread_id in self._inflight:
+                self._inflight[thread_id]["conv_id"] = cid
+
+        task = asyncio.current_task()
+        self._inflight[thread_id] = {"conv_id": "", "task": task}
+
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
+        try:
+            context, file_paths = await self.build_channel_context(channel)
+            file_paths.extend(all_attachment_paths)
+
+            result = await self.zo.ask_stream(
+                user_text,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                model_name=effective_model,
+                persona_id=effective_persona,
+            )
+            response, conv_id = result.output, result.conv_id
+
+            rename = self.queued_renames.pop(conv_id, None)
+            if rename:
+                try:
+                    await asyncio.wait_for(thread.edit(name=rename[:100]), timeout=10.0)
+                    await update_thread_name(thread_id, rename[:100])
+                except (asyncio.TimeoutError, discord.HTTPException) as e:
+                    logger.warning(f"Failed to apply queued rename: {e}")
+                    await update_thread_name(thread_id, rename[:100])
+
+            if not response or not response.strip():
+                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events})")
+                response, conv_id = await self._retry_empty_response(
+                    thread_id, conv_id, thread, on_thinking, on_conv_id,
+                )
+
+            chunks = self.zo.chunk_response(response)
+            chunks = [c for c in chunks if c.strip()]
+            if not chunks:
+                logger.error(f"All retries exhausted for conv {conv_id}")
+                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\nSend another message to try again."]
+            for chunk in chunks:
+                await send_suppressed(thread, content=chunk)
+            logger.info(f"Sent response in thread {thread.id}, conv_id {conv_id}")
+
+        except asyncio.CancelledError:
+            logger.info(f"Batched channel message request cancelled for thread {thread_id}")
+        except Exception as e:
+            logger.error(f"Error handling batched messages in #{channel.name}: {e}", exc_info=True)
+            try:
+                await self.set_status(thread, "error")
+            except Exception:
+                pass
+        finally:
+            self._inflight.pop(thread_id, None)
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
             await self._drain_queue(thread_id)
 
     def _get_channel_name_for_thread(self, thread: discord.Thread) -> str:

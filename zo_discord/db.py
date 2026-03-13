@@ -62,6 +62,10 @@ async def init_db():
             await db.execute("ALTER TABLE channel_config ADD COLUMN model TEXT DEFAULT NULL")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN buffer_seconds REAL DEFAULT NULL")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -193,7 +197,7 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
         if existing:
             sets = []
             vals = []
-            for key in ("instructions", "memory_paths", "persona_id", "model"):
+            for key in ("instructions", "memory_paths", "persona_id", "model", "buffer_seconds"):
                 if key in kwargs:
                     sets.append(f"{key} = ?")
                     vals.append(kwargs[key])
@@ -207,14 +211,15 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
                 )
         else:
             await db.execute("""
-                INSERT INTO channel_config (channel_id, instructions, memory_paths, persona_id, model, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO channel_config (channel_id, instructions, memory_paths, persona_id, model, buffer_seconds, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 channel_id,
                 kwargs.get("instructions"),
                 kwargs.get("memory_paths", "[]"),
                 kwargs.get("persona_id"),
                 kwargs.get("model"),
+                kwargs.get("buffer_seconds"),
                 now
             ))
         await db.commit()

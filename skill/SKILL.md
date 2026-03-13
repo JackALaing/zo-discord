@@ -147,6 +147,7 @@ Fields:
 - `memory_paths` (array of workspace-relative paths) — each path is passed to Zo as a file to read at the start of every conversation in that channel. zo-discord has no built-in memory system — these paths should point to files maintained by an external memory system.
 - `model` (string) — model ID override for this channel. Overrides the global default.
 - `persona_id` (string) — persona ID override for this channel. Overrides the global default.
+- `buffer_seconds` (number) — seconds to wait after the last message before processing (0 = disabled, null = use global default). See README for details on typing detection and behavior.
 
 ### Health Check
 
@@ -200,6 +201,10 @@ The `zo-discord` CLI auto-detects the conversation ID from:
 It calls `POST /conversations/{conv_id}/action`, which resolves the Discord thread ID internally. No thread ID needed.
 
 Install with `ln -sf /path/to/zo-discord/skill/scripts/discord-cli.sh /usr/local/bin/zo-discord` for global access (see README).
+
+## User Customization
+
+Users can customize zo-discord via Discord slash commands — model, persona, message buffering, thinking mode, auto-archive, channel instructions, memory paths, and allowed users. Tell users to type `/help` in Discord to see all available commands.
 
 ## How the Bot Works
 

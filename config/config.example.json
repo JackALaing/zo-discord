@@ -9,5 +9,6 @@
   "max_message_length": 1900,
   "data_dir": "discord_data",
   "thinking_mode": "streaming",
-  "auto_archive_override": true
+  "auto_archive_override": true,
+  "buffer_seconds": 0
 }

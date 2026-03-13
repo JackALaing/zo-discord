@@ -26,6 +26,7 @@ def _save_config_key(key: str, value):
 
 TIPS = [
     "zo-discord supports **message queuing**. Send multiple messages while Zo is thinking — they'll be batched into one message when the current turn finishes.",
+    "zo-discord supports **message buffering** (`/buffer`). Set a delay (e.g. 2s) so rapid-fire messages are combined into a single request. The timer pauses while you're typing, so you won't feel rushed. Great for composing multi-part prompts.",
     "Use zo-discord as a **notification channel** for scheduled tasks instead of SMS/email/Telegram. See the zo-discord skill for more details.",
     "zo-discord can override Discord's **auto-archive** behavior to keep threads open until you manually archive them. React with :white_check_mark: to any message in the thread to archive it. Set this as your double-tap reaction on mobile for quick archiving.",
     "You can set **model and persona per-channel** using the `/model` and `/persona` commands. Models and personas use IDs that are hard to remember, so you can ask Zo to set aliases, then use the alias. You can also prefix your prompt with `/model-alias` (e.g. `/opus`) and `@persona-alias` (e.g. `@pirate`) to override the channel default. For example, you could set Sonnet as your default model for the channel, but prefix a prompt with `/opus` to use Opus for just that conversation.",
@@ -265,6 +266,86 @@ class AutoArchiveSelectView(ui.View):
         )
 
 
+class BufferSelectView(ui.View):
+    def __init__(self, bot, current_global: float, current_channel: float | None, channel_id: str | None):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.current_global = current_global
+        self.current_channel = current_channel
+        self.channel_id = channel_id
+
+    @ui.button(label="Change Global", style=discord.ButtonStyle.primary)
+    async def change_global(self, button: ui.Button, interaction: discord.Interaction):
+        modal = GlobalBufferModal(self.bot, self.current_global)
+        await interaction.response.send_modal(modal)
+
+    @ui.button(label="Change Channel", style=discord.ButtonStyle.secondary)
+    async def change_channel(self, button: ui.Button, interaction: discord.Interaction):
+        modal = ChannelBufferModal(self.bot, self.current_channel, self.channel_id)
+        await interaction.response.send_modal(modal)
+
+
+class GlobalBufferModal(ui.Modal):
+    def __init__(self, bot, current_value: float):
+        super().__init__(title="Set Global Buffer")
+        self.bot = bot
+        self.buffer_input = ui.InputText(
+            label="Buffer seconds (0 to disable)",
+            placeholder="e.g. 2, 5, 0",
+            value=str(current_value),
+            required=True,
+        )
+        self.add_item(self.buffer_input)
+
+    async def callback(self, interaction: discord.Interaction):
+        raw = self.buffer_input.value.strip()
+        try:
+            value = float(raw)
+            if value < 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("Invalid value. Enter a number >= 0.", ephemeral=True)
+            return
+        _save_config_key("buffer_seconds", value)
+        self.bot.config["buffer_seconds"] = value
+        status = f"**{value}s**" if value > 0 else "**Disabled** (0s)"
+        await interaction.response.send_message(f"Global buffer updated to {status}.", ephemeral=True)
+
+
+class ChannelBufferModal(ui.Modal):
+    def __init__(self, bot, current_value: float | None, channel_id: str | None):
+        super().__init__(title="Set Channel Buffer")
+        self.bot = bot
+        self.channel_id = channel_id
+        self.buffer_input = ui.InputText(
+            label="Buffer seconds (blank to use global default)",
+            placeholder="e.g. 2, 5, 0, or blank for global default",
+            value=str(current_value) if current_value is not None else "",
+            required=False,
+        )
+        self.add_item(self.buffer_input)
+
+    async def callback(self, interaction: discord.Interaction):
+        raw = self.buffer_input.value.strip()
+        if not raw:
+            value = None
+        else:
+            try:
+                value = float(raw)
+                if value < 0:
+                    raise ValueError
+            except ValueError:
+                await interaction.response.send_message("Invalid value. Enter a number >= 0, or leave blank.", ephemeral=True)
+                return
+        if self.channel_id:
+            await set_channel_config(self.channel_id, buffer_seconds=value)
+        if value is not None:
+            status = f"**{value}s**" if value > 0 else "**Disabled** (0s)"
+        else:
+            status = "**Cleared** (using global default)"
+        await interaction.response.send_message(f"Channel buffer updated to {status}.", ephemeral=True)
+
+
 class AllowedUsersView(ui.View):
     def __init__(self, bot):
         super().__init__(timeout=120)
@@ -331,6 +412,7 @@ def setup_commands(bot):
         lines.append("`/model` — View/change default model")
         lines.append("`/persona` — View/change default persona")
         lines.append("`/thinking` — Toggle thinking mode")
+        lines.append("`/buffer` — Configure message buffering")
         lines.append("`/auto-archive` — Configure auto-archive")
         lines.append("`/instructions` — View channel instructions")
         lines.append("`/memory` — View channel memory paths")
@@ -470,6 +552,45 @@ def setup_commands(bot):
             view=view,
             ephemeral=True,
         )
+
+    @bot.slash_command(name="buffer", description="Configure message buffering (debounce)")
+    async def buffer_cmd(ctx: discord.ApplicationContext):
+        config = load_config()
+        global_buffer = config.get("buffer_seconds", 0)
+
+        channel = ctx.channel
+        if isinstance(channel, discord.Thread) and channel.parent:
+            channel = channel.parent
+        channel_id = str(channel.id)
+
+        ch_config = await get_channel_config(channel_id)
+        channel_buffer = ch_config.get("buffer_seconds") if ch_config else None
+
+        # Compute effective value
+        effective = channel_buffer if channel_buffer is not None else global_buffer
+        effective_str = f"{effective}s" if effective > 0 else "Disabled"
+
+        global_str = f"{global_buffer}s" if global_buffer > 0 else "Disabled (0s)"
+        if channel_buffer is not None:
+            channel_str = f"{channel_buffer}s" if channel_buffer > 0 else "Disabled (0s)"
+        else:
+            channel_str = "Not set (using global)"
+
+        lines = [
+            f"**Global default:** {global_str}",
+            f"**#{channel.name} default:** {channel_str}",
+            f"**Effective:** {effective_str}",
+            "",
+            "When enabled, rapid-fire messages are combined into a single "
+            "request before Zo starts processing. Each new message resets "
+            "the countdown. The buffer pauses while you're typing, so "
+            "you won't feel rushed.",
+            "",
+            "*Set to 0 to disable.*",
+        ]
+
+        view = BufferSelectView(bot, global_buffer, channel_buffer, channel_id)
+        await ctx.respond("\n".join(lines), view=view, ephemeral=True)
 
     @bot.slash_command(name="instructions", description="View this channel's custom instructions")
     async def instructions_cmd(ctx: discord.ApplicationContext):

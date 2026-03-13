@@ -12,6 +12,7 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 ### Interactive Conversations
 - **Typing indicator** — Shows when Zo is actively processing a message.
 - **Streaming thoughts** — See Zo's intermediate thinking in real-time, or set quiet mode to only see the final response. Toggle with `/thinking`.
+- **Message buffering** — Set a delay (e.g. 2s) so rapid-fire messages are combined into a single request before Zo starts processing. The timer pauses while you're typing, so you won't feel rushed. Configure with `/buffer`.
 - **Message queuing** — Send multiple messages while Zo is thinking. They're batched and delivered when the current turn finishes.
 - **Reply context** — Reply to a specific message in a thread and Zo sees which message you're responding to.
 - **File attachments** — Attach files to your messages and Zo will receive them.
@@ -22,7 +23,7 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 - **Personas** — Set a default persona globally or per-channel with `/persona`. Define aliases and prefix a new conversation with `@alias` (e.g. `@pirate`) to override for that thread.
 - **Channel instructions & memory** — Set custom instructions and memory file paths per-channel — they're injected into every conversation. Channel topic and pinned messages also provide context.
 - **Allowed users** — Restrict bot access to specific Discord users, or allow all users. Manage with `/allowed-users`.
-- **Slash commands** — `/help`, `/model`, `/persona`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`
+- **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`
 
 ### Scheduled Agents
 - **Notifications** — Scheduled Zo agents can post results to new Discord threads with session continuity, so you can reply and continue the conversation. See `skill/scheduled-agent-example.md`.
@@ -91,7 +92,8 @@ Edit `config/config.json` with your IDs from step 2:
   "max_message_length": 1900,
   "data_dir": "discord_data",
   "thinking_mode": "streaming",
-  "auto_archive_override": true
+  "auto_archive_override": true,
+  "buffer_seconds": 0
 }
 ```
 
@@ -108,6 +110,7 @@ Edit `config/config.json` with your IDs from step 2:
 | `data_dir` | Path for channel data and attachments. Defaults to `discord_data/` in the bot directory |
 | `thinking_mode` | `"streaming"` shows Zo's intermediate thinking; `"quiet"` shows only final responses |
 | `auto_archive_override` | `true` prevents Discord from auto-archiving threads; `false` uses channel defaults |
+| `buffer_seconds` | Seconds to wait after the last message before processing (0 = disabled). See [Message Buffering](#message-buffering) |
 
 ### 6. Register as a Zo Service
 
@@ -177,6 +180,7 @@ All settings changed via slash commands are persisted to `config.json` and survi
 | `/link` | Open conversation in Zo |
 | `/model` | View/change default model |
 | `/persona` | View/change default persona |
+| `/buffer` | Configure message buffering (global or per-channel) |
 | `/thinking` | Toggle thinking mode (streaming/quiet) |
 | `/auto-archive` | Configure auto-archive behavior |
 | `/instructions` | View channel instructions |
@@ -238,6 +242,22 @@ The `/persona` slash command shows all configured aliases. To find your persona 
 - **Auto-archive prevention**: When enabled, a background routine bumps thread timers every 6 hours and auto-archives are reversed in real-time. Toggle with `/auto-archive`.
 - **Archive a thread**: React with :white_check_mark: on any bot message. The thread is removed from the watch list and archived. Set :white_check_mark: as your double-tap reaction on mobile for quick archiving.
 - **Un-archive**: Manually un-archiving a thread or replying to it adds it back to the watch list.
+
+## Message Buffering
+
+Set a delay (e.g. 3s) so rapid-fire messages are combined into a single request before Zo starts processing:
+
+```
+1. hey Zo can you review this PR     ← buffer starts (3s countdown)
+2. oh wait also check the tests      ← countdown resets to 3s
+   ← 3s passes with no new messages → both messages sent as one request
+```
+
+Each new message resets the countdown. The bot shows a typing indicator while waiting. If you start typing, the countdown **pauses** so you won't feel rushed — it resumes ~10s after you stop pressing keys, or resets when you send your next message. Channel messages defer thread creation until the buffer flushes.
+
+If Zo is already processing, new messages bypass the buffer and queue for the next turn.
+
+Configure with `/buffer` (global or per-channel) or set `buffer_seconds` in `config/config.json` (default: `0` = disabled). Per-channel overrides the global default.
 
 ## Discord Formatting
 
