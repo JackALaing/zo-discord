@@ -24,6 +24,7 @@ class StreamResult:
     conv_id: str
     interrupted: bool  # stream broke before End event
     received_events: bool  # got any SSE events at all
+    error_message: str = ""  # SSEErrorEvent message if stream errored
 
 from zo_discord import PROJECT_ROOT
 
@@ -137,6 +138,7 @@ class ZoClient:
         final_output = ""
         stream_interrupted = False
         received_any_events = False
+        sse_error_message = ""
 
         # Outer retry loop for session pool exhaustion (all sessions busy).
         # Inner loop handles conversation-specific 409s (shorter delays).
@@ -262,6 +264,7 @@ class ZoClient:
                                     elif current_event_type == "SSEErrorEvent":
                                         error_msg = event.get("message", "")
                                         logger.warning(f"SSE error event for conv {conv_id}: {error_msg}")
+                                        sse_error_message = error_msg
                                         stream_interrupted = True
                                         break
 
@@ -293,6 +296,7 @@ class ZoClient:
             conv_id=conv_id,
             interrupted=stream_interrupted,
             received_events=received_any_events,
+            error_message=sse_error_message,
         )
 
     def generate_thread_title_simple(self, user_message: str) -> str:

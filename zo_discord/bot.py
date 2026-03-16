@@ -730,10 +730,13 @@ class ZoDiscordBot(commands.Bot):
                     await update_thread_name(thread_id, rename[:100])
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events})")
-                response, conv_id = await self._retry_empty_response(
-                    thread_id, conv_id, thread, on_thinking, on_conv_id,
-                )
+                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
+                if result.error_message:
+                    response = f"\u26a0\ufe0f **Request failed.**\n\n`{result.error_message[:200]}`\n\nSend another message to try again."
+                else:
+                    response, conv_id = await self._retry_empty_response(
+                        thread_id, conv_id, thread, on_thinking, on_conv_id,
+                    )
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
@@ -860,10 +863,13 @@ class ZoDiscordBot(commands.Bot):
                     await update_thread_name(thread_id, rename[:100])
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events})")
-                response, conv_id = await self._retry_empty_response(
-                    thread_id, conv_id, thread, on_thinking, on_conv_id,
-                )
+                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
+                if result.error_message:
+                    response = f"\u26a0\ufe0f **Request failed.**\n\n`{result.error_message[:200]}`\n\nSend another message to try again."
+                else:
+                    response, conv_id = await self._retry_empty_response(
+                        thread_id, conv_id, thread, on_thinking, on_conv_id,
+                    )
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
@@ -1042,10 +1048,13 @@ class ZoDiscordBot(commands.Bot):
             await update_activity(thread_id)
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
-                response, new_conv_id = await self._retry_empty_response(
-                    thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
-                )
+                logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
+                if result.error_message:
+                    response = f"\u26a0\ufe0f **Request failed.**\n\n`{result.error_message[:200]}`\n\nSend another message to try again."
+                else:
+                    response, new_conv_id = await self._retry_empty_response(
+                        thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
+                    )
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
@@ -1178,7 +1187,7 @@ class ZoDiscordBot(commands.Bot):
                 "please respond with your results."
             )
 
-        retry_delays = [15, 30, 60]
+        retry_delays = [30, 60, 120]
         for attempt, delay in enumerate(retry_delays, 1):
             logger.warning(f"Empty response (conv {conv_id}), continue attempt {attempt}/{len(retry_delays)} in {delay}s")
             await asyncio.sleep(delay)
