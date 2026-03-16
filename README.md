@@ -279,6 +279,7 @@ zo-discord/
 │   ├── __init__.py
 │   ├── bot.py              # Main bot — event handlers, HTTP API, message processing
 │   ├── zo_client.py        # Zo API client — streaming, retries, title generation
+│   ├── hermes.py           # Hermes backend support — URL routing, session ID handling
 │   ├── db.py               # SQLite database — thread mappings, channel config
 │   ├── commands.py         # Slash commands and UI components
 │   └── utils.py            # Pure utility functions (status prefixes)
@@ -297,6 +298,44 @@ zo-discord/
 ├── LICENSE
 └── README.md
 ```
+
+## Hermes Backend
+
+zo-discord supports routing conversations to [Hermes Agent](https://hermes-agent.nousresearch.com/) instead of the Zo API. Hermes runs locally via `zo-hermes` (a FastAPI bridge on port 8788) and provides cancel/interrupt support, context compression, and native tool use.
+
+### Configuration
+
+Set the backend globally in `config/config.json`:
+
+```json
+{
+  "backend": "hermes"
+}
+```
+
+Or per-channel via the `channel_config` DB table (set `backend` column to `"hermes"` or `"zo"`). Per-channel overrides the global default.
+
+### How It Works
+
+All Hermes-specific logic lives in `zo_discord/hermes.py`:
+
+- **URL routing**: Hermes requests go to `http://127.0.0.1:8788/ask` (localhost, no auth). Zo requests go to `https://api.zo.computer/zo/ask` (Bearer token auth).
+- **Model names**: Hermes uses standard model IDs (e.g. `anthropic/claude-opus-4.6`). Zo BYOK model IDs (`byok:xxx`) are stripped by `zo-hermes`, which falls back to its configured default.
+- **Session ID changes**: When Hermes compresses context in a long conversation, it creates a new session ID linked to the old one. The End SSE event carries the new ID, and zo-discord updates the thread-to-conversation mapping automatically.
+- **SSE streaming**: `zo-hermes` emits Zo-compatible SSE events (`PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`), so the core streaming/parsing code is shared.
+- **Personas**: Hermes uses `SOUL.md` personalities, not Zo `persona_id`s. The `persona_id` field is accepted but ignored.
+
+### Changes to Core Modules
+
+The Hermes integration touches `bot.py` and `zo_client.py` minimally:
+
+- **`bot.py`**: `resolve_channel_defaults()` returns a third value (`backend`), which is threaded through to `ask_stream()` and `_retry_empty_response()` calls. No Hermes-specific logic in bot.py.
+- **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter but delegates all backend-specific decisions to the hermes module.
+
+### Dependencies
+
+- `zo-hermes` Zo service (`svc_bInt4_9RgFI`) must be running on port 8788
+- See `Knowledge/zo/Hermes/zo-hermes-skill-draft.md` for zo-hermes setup and troubleshooting
 
 ## License
 
