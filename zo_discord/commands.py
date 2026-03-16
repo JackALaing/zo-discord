@@ -10,9 +10,31 @@ import discord
 from discord import ui
 from zo_discord import PROJECT_ROOT
 from zo_discord.db import get_channel_config, set_channel_config, get_conversation_id
+from zo_discord.hermes import is_hermes
 from zo_discord.zo_client import load_config
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+
+
+async def _get_channel_backend(ctx: discord.ApplicationContext) -> str | None:
+    """Get the backend configured for the channel where the command was invoked."""
+    channel = ctx.channel
+    if isinstance(channel, discord.Thread) and channel.parent:
+        channel = channel.parent
+    ch_config = await get_channel_config(str(channel.id))
+    return ch_config.get("backend") if ch_config else None
+
+
+def _is_hermes_ctx(backend: str | None) -> bool:
+    """Check if the channel backend is Hermes."""
+    config = load_config()
+    return is_hermes(backend, config.get("default_backend", "zo"))
+
+
+def _backend_label(backend: str | None) -> str:
+    """Human-readable backend name."""
+    config = load_config()
+    return "Hermes" if is_hermes(backend, config.get("default_backend", "zo")) else "Zo"
 
 
 def _save_config_key(key: str, value):
@@ -387,6 +409,39 @@ class AllowedUserModal(ui.Modal):
         )
 
 
+class BackendSelectView(ui.View):
+    def __init__(self, bot, current_global: str, current_channel: str | None, channel_id: str):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.current_global = current_global
+        self.current_channel = current_channel
+        self.channel_id = channel_id
+
+    @ui.button(label="Set Channel → Zo", style=discord.ButtonStyle.primary)
+    async def set_zo(self, button: ui.Button, interaction: discord.Interaction):
+        await set_channel_config(self.channel_id, backend="zo")
+        await interaction.response.edit_message(
+            content="Channel backend set to **Zo**. New threads will use the Zo API.",
+            view=None,
+        )
+
+    @ui.button(label="Set Channel → Hermes", style=discord.ButtonStyle.success)
+    async def set_hermes(self, button: ui.Button, interaction: discord.Interaction):
+        await set_channel_config(self.channel_id, backend="hermes")
+        await interaction.response.edit_message(
+            content="Channel backend set to **Hermes**. New threads will use the local Hermes agent.",
+            view=None,
+        )
+
+    @ui.button(label="Clear Channel Override", style=discord.ButtonStyle.secondary)
+    async def clear(self, button: ui.Button, interaction: discord.Interaction):
+        await set_channel_config(self.channel_id, backend=None)
+        await interaction.response.edit_message(
+            content=f"Channel backend cleared. Using global default (**{self.current_global}**).",
+            view=None,
+        )
+
+
 def setup_commands(bot):
     """Register all slash commands on the bot."""
 
@@ -394,23 +449,29 @@ def setup_commands(bot):
     async def help_cmd(ctx: discord.ApplicationContext):
         config = load_config()
         model_display = _display_model(config.get("model"))
+        backend = await _get_channel_backend(ctx)
+        hermes = _is_hermes_ctx(backend)
+        backend_name = _backend_label(backend)
         conv_id = None
         if isinstance(ctx.channel, discord.Thread):
             conv_id = await get_conversation_id(str(ctx.channel.id))
 
         lines = [
             "**zo-discord**",
+            f"Backend: {backend_name}",
             f"Model: {model_display}",
         ]
         if conv_id:
-            lines.append(f"Conversation: `{conv_id}`")
+            label = "Session" if hermes else "Conversation"
+            lines.append(f"{label}: `{conv_id}`")
         lines.append("")
         lines.append("**Commands**")
         lines.append("`/help` — This message")
         lines.append("`/tips` — Tips and tricks")
-        lines.append("`/link` — Open conversation in Zo")
+        lines.append("`/link` — Open conversation in Zo" if not hermes else "`/link` — Show session ID")
         lines.append("`/model` — View/change default model")
         lines.append("`/persona` — View/change default persona")
+        lines.append("`/backend` — View/change backend (Zo/Hermes)")
         lines.append("`/thinking` — Toggle thinking mode")
         lines.append("`/buffer` — Configure message buffering")
         lines.append("`/auto-archive` — Configure auto-archive")
@@ -435,6 +496,16 @@ def setup_commands(bot):
         conv_id = await get_conversation_id(str(ctx.channel.id))
         if not conv_id or conv_id == "":
             await ctx.respond("No conversation linked to this thread yet.", ephemeral=True)
+            return
+
+        backend = await _get_channel_backend(ctx)
+        if _is_hermes_ctx(backend):
+            await ctx.respond(
+                f"**Hermes session:** `{conv_id}`\n\n"
+                "*Hermes sessions don't have a web UI link. "
+                "Use the CLI to inspect session state.*",
+                ephemeral=True,
+            )
             return
 
         handle = os.environ.get("ZO_USER", "")
@@ -645,6 +716,33 @@ def setup_commands(bot):
             view=view,
             ephemeral=True,
         )
+
+    @bot.slash_command(name="backend", description="View or change the AI backend (Zo or Hermes)")
+    async def backend_cmd(ctx: discord.ApplicationContext):
+        config = load_config()
+        global_backend = config.get("backend", "zo")
+
+        channel = ctx.channel
+        if isinstance(channel, discord.Thread) and channel.parent:
+            channel = channel.parent
+        channel_id = str(channel.id)
+
+        ch_config = await get_channel_config(channel_id)
+        channel_backend = ch_config.get("backend") if ch_config else None
+
+        effective = channel_backend or global_backend
+
+        lines = [
+            f"**Global default:** {global_backend}",
+            f"**#{channel.name}:** {channel_backend or 'Not set (using global)'}",
+            f"**Effective:** {effective}",
+            "",
+            "**Zo** — Zo Cloud API (remote, full Zo tool suite)\n"
+            "**Hermes** — Local Hermes agent (localhost:8788, extended thinking, cancel support)",
+        ]
+
+        view = BackendSelectView(bot, global_backend, channel_backend, channel_id)
+        await ctx.respond("\n".join(lines), view=view, ephemeral=True)
 
     @bot.slash_command(name="cli", description="Show zo-discord CLI commands available to Zo")
     async def cli_cmd(ctx: discord.ApplicationContext):
