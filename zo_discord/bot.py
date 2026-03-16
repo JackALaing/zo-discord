@@ -1010,7 +1010,7 @@ class ZoDiscordBot(commands.Bot):
         # If this message was bundled with earlier queued messages, prepend them
         bundled_prefix = self._bundled_prefixes.pop(message.id, None)
         if bundled_prefix:
-            user_input = f"[Earlier messages sent while you were working:]\n{bundled_prefix}\n\n[Latest message:]\n{user_input}"
+            user_input = f"{bundled_prefix}\n[{message.author.display_name}]: {user_input}"
 
         on_thinking = self.make_on_thinking(thread)
 
@@ -1240,7 +1240,7 @@ class ZoDiscordBot(commands.Bot):
                 earlier_parts = []
                 for msg in queued_msgs[:-1]:
                     earlier_parts.append(f"[{msg.author.display_name}]: {msg.content}")
-                bundle_prefix = "\n".join(earlier_parts)
+                bundle_prefix = "[Messages sent while you were working:]\n" + "\n".join(earlier_parts)
                 self._bundled_prefixes[primary.id] = bundle_prefix
                 await self.handle_thread_message(primary)
         except Exception as e:
