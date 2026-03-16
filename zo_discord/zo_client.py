@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncGenerator, Callable, Awaitable
 
+from zo_discord.hermes import get_request_config, get_backend_label, handle_session_id_change
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +70,7 @@ def load_config() -> dict:
 
 
 class ZoClient:
-    """Async client for the Zo API."""
+    """Async client for the Zo API (or Hermes via zo-hermes)."""
 
     BASE_URL = "https://api.zo.computer"
 
@@ -80,6 +82,7 @@ class ZoClient:
         config = load_config()
         self.model = config.get("model")
         self.max_length = config.get("max_message_length", 1900)
+        self.backend = config.get("backend", "zo")  # "zo" or "hermes"
 
     async def ask_stream(
         self,
@@ -91,9 +94,10 @@ class ZoClient:
         on_conv_id: Callable[[str], Awaitable[None]] = None,
         model_name: str = None,
         persona_id: str = None,
+        backend: str = None,
     ) -> StreamResult:
         """
-        Send a message to Zo via the /zo/ask streaming endpoint.
+        Send a message to Zo or Hermes via streaming endpoint.
 
         Args:
             input_text: The user's message
@@ -102,6 +106,7 @@ class ZoClient:
             file_paths: Optional list of file paths referenced in the context
             on_thinking: Async callback for thinking previews (receives text to post)
             on_conv_id: Async callback when conversation ID is received
+            backend: Override backend ("zo" or "hermes"), defaults to self.backend
 
         Returns:
             StreamResult with output, conv_id, and diagnostic info
@@ -126,12 +131,10 @@ class ZoClient:
         if persona_id:
             payload["persona_id"] = persona_id
 
-        logger.info(f"Sending to Zo API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}")
+        api_url, headers = get_request_config(self.api_key, backend, self.backend)
+        backend_label = get_backend_label(backend, self.backend)
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        logger.info(f"Sending to {backend_label} API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}")
 
         timeout = aiohttp.ClientTimeout(total=1800)
         conv_id = conversation_id or ""
@@ -153,7 +156,7 @@ class ZoClient:
             for attempt in range(max_409_attempts):
                 async with aiohttp.ClientSession(timeout=timeout) as session:
                     async with session.post(
-                        f"{self.BASE_URL}/zo/ask",
+                        api_url,
                         headers=headers,
                         json=payload,
                     ) as resp:
@@ -269,7 +272,13 @@ class ZoClient:
                                         break
 
                                     elif current_event_type == "End":
-                                        final_output = event.get("data", {}).get("output", "")
+                                        end_data = event.get("data", {})
+                                        final_output = end_data.get("output", "")
+                                        new_conv = handle_session_id_change(end_data, conv_id)
+                                        if new_conv:
+                                            conv_id = new_conv
+                                            if on_conv_id:
+                                                await on_conv_id(conv_id)
                                         stream_done = True
                                         break
                                 if stream_done:
@@ -290,6 +299,13 @@ class ZoClient:
                 continue  # retry outer pool loop
 
             break  # success or non-pool error — exit outer loop
+
+        # Fallback: if End event had empty output but we accumulated streamed text,
+        # use the streamed text. This can happen when zo-hermes streams deltas but
+        # the final_response field is empty.
+        if not final_output and text_buffer.strip():
+            logger.info(f"Using streamed text_buffer as output for conv {conv_id} (End event output was empty)")
+            final_output = text_buffer
 
         return StreamResult(
             output=final_output,

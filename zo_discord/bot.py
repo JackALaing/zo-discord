@@ -282,15 +282,15 @@ class ZoDiscordBot(commands.Bot):
             return float(ch_config["buffer_seconds"])
         return float(self.config.get("buffer_seconds", 0))
 
-    async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None]:
-        """Get the effective model and persona for a channel.
+    async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None, str | None]:
+        """Get the effective model, persona, and backend for a channel.
 
-        Returns (model_id_or_none, persona_id_or_none) from channel_config.
+        Returns (model_id_or_none, persona_id_or_none, backend_or_none) from channel_config.
         """
         ch_config = await get_channel_config(channel_id)
         if not ch_config:
-            return None, None
-        return ch_config.get("model"), ch_config.get("persona_id")
+            return None, None, None
+        return ch_config.get("model"), ch_config.get("persona_id"), ch_config.get("backend")
 
     async def on_ready(self):
         if not self._initialized:
@@ -655,8 +655,8 @@ class ZoDiscordBot(commands.Bot):
         if persona_override:
             logger.info(f"Persona override detected: {persona_override}")
 
-        # Resolve channel defaults (model, persona)
-        channel_model, channel_persona = await self.resolve_channel_defaults(str(message.channel.id))
+        # Resolve channel defaults (model, persona, backend)
+        channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(message.channel.id))
 
         # Priority: message prefix > channel default > global default
         effective_model = model_override or channel_model  # global default handled by ZoClient
@@ -715,6 +715,7 @@ class ZoDiscordBot(commands.Bot):
                 on_conv_id=on_conv_id,
                 model_name=effective_model,
                 persona_id=effective_persona,
+                backend=channel_backend,
             )
             response, conv_id = result.output, result.conv_id
 
@@ -736,6 +737,7 @@ class ZoDiscordBot(commands.Bot):
                 else:
                     response, conv_id = await self._retry_empty_response(
                         thread_id, conv_id, thread, on_thinking, on_conv_id,
+                        backend=channel_backend,
                     )
 
             chunks = self.zo.chunk_response(response)
@@ -808,7 +810,7 @@ class ZoDiscordBot(commands.Bot):
         user_text = "\n".join(combined_parts)
 
         # Resolve channel defaults
-        channel_model, channel_persona = await self.resolve_channel_defaults(str(channel.id))
+        channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(channel.id))
         effective_model = effective_model or channel_model
         config = load_config()
         effective_persona = effective_persona or channel_persona or config.get("default_persona")
@@ -850,6 +852,7 @@ class ZoDiscordBot(commands.Bot):
                 on_conv_id=on_conv_id,
                 model_name=effective_model,
                 persona_id=effective_persona,
+                backend=channel_backend,
             )
             response, conv_id = result.output, result.conv_id
 
@@ -869,6 +872,7 @@ class ZoDiscordBot(commands.Bot):
                 else:
                     response, conv_id = await self._retry_empty_response(
                         thread_id, conv_id, thread, on_thinking, on_conv_id,
+                        backend=channel_backend,
                     )
 
             chunks = self.zo.chunk_response(response)
@@ -945,16 +949,20 @@ class ZoDiscordBot(commands.Bot):
         if persona_override:
             logger.info(f"Persona override detected in thread: {persona_override}")
 
-        # For new conversations (first reply to notification threads), apply channel defaults
+        # Apply channel defaults (model, persona, backend) from parent channel.
+        # Backend must ALWAYS be resolved (even for existing conversations) so that
+        # threads with Hermes session IDs route to zo-hermes, not Zo.
         parent_channel_id = str(thread.parent.id) if thread.parent else None
         effective_model = model_override
         effective_persona = persona_override
-        if not conv_id and parent_channel_id:
-            channel_model, channel_persona = await self.resolve_channel_defaults(parent_channel_id)
-            if not effective_model:
-                effective_model = channel_model
-            if not effective_persona:
-                effective_persona = channel_persona
+        channel_backend = None
+        if parent_channel_id:
+            channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(parent_channel_id)
+            if not conv_id:
+                if not effective_model:
+                    effective_model = channel_model
+                if not effective_persona:
+                    effective_persona = channel_persona
         if not effective_persona:
             config = load_config()
             effective_persona = config.get("default_persona")
@@ -1035,6 +1043,7 @@ class ZoDiscordBot(commands.Bot):
                 on_conv_id=on_conv_id,
                 model_name=effective_model,
                 persona_id=effective_persona,
+                backend=channel_backend,
             )
             response, new_conv_id = result.output, result.conv_id
 
@@ -1054,6 +1063,7 @@ class ZoDiscordBot(commands.Bot):
                 else:
                     response, new_conv_id = await self._retry_empty_response(
                         thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
+                        backend=channel_backend,
                     )
 
             chunks = self.zo.chunk_response(response)
@@ -1101,6 +1111,7 @@ class ZoDiscordBot(commands.Bot):
                     recovery_result = await self.zo.ask_stream(
                         recovery_input,
                         conversation_id=recovery_conv_id,
+                        backend=channel_backend,
                     )
                     if recovery_result.conv_id != recovery_conv_id:
                         await update_conversation_id(thread_id, recovery_result.conv_id)
@@ -1170,6 +1181,7 @@ class ZoDiscordBot(commands.Bot):
         thread: discord.Thread,
         on_thinking,
         on_conv_id,
+        backend: str = None,
     ) -> tuple[str, str]:
         """Recover from an empty or interrupted response.
 
@@ -1198,6 +1210,7 @@ class ZoDiscordBot(commands.Bot):
                     conversation_id=conv_id,
                     on_thinking=on_thinking,
                     on_conv_id=on_conv_id,
+                    backend=backend,
                 )
                 if result.conv_id != conv_id:
                     await update_conversation_id(thread_id, result.conv_id)
@@ -2049,7 +2062,7 @@ class ZoDiscordBot(commands.Bot):
             context, file_paths = await self.build_channel_context(channel, include_source=True, thread=thread)
 
             # Resolve channel model/persona defaults
-            channel_model, channel_persona = await self.resolve_channel_defaults(str(channel.id))
+            channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(channel.id))
             config = load_config()
             effective_persona = channel_persona or config.get("default_persona")
 
@@ -2068,6 +2081,7 @@ class ZoDiscordBot(commands.Bot):
                 on_conv_id=on_conv_id,
                 model_name=channel_model,
                 persona_id=effective_persona,
+                backend=channel_backend,
             )
             response, new_conv_id = result.output, result.conv_id
 
@@ -2075,6 +2089,7 @@ class ZoDiscordBot(commands.Bot):
                 logger.warning(f"Empty response for new thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
                 response, new_conv_id = await self._retry_empty_response(
                     thread_id_str, new_conv_id, thread, on_thinking, on_conv_id,
+                    backend=channel_backend,
                 )
 
             chunks = self.zo.chunk_response(response)
