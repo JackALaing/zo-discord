@@ -40,7 +40,7 @@ Commands:
   new-thread <title> <prompt> [--channel-name NAME]  Spawn a new thread
 
 Channel targeting: use --channel-name <name> or --channel <id>
-Conv ID: auto-detected from workspace path, ZO_CONVERSATION_ID, or --conv-id <id>
+Conv ID: auto-detected from workspace path, CONVERSATION_ID (or ZO_CONVERSATION_ID), or --conv-id <id>
 HELP
   exit 0
 fi
@@ -63,14 +63,16 @@ if [[ -z "$CONV_ID" && "$PWD" =~ /home/\.z/workspaces/(con_[^/]+) ]]; then
   CONV_ID="${BASH_REMATCH[1]}"
 fi
 
-# 3. Try ZO_CONVERSATION_ID env var
-if [[ -z "$CONV_ID" && -n "${ZO_CONVERSATION_ID:-}" ]]; then
+# 3. Try CONVERSATION_ID or ZO_CONVERSATION_ID env var
+if [[ -z "$CONV_ID" && -n "${CONVERSATION_ID:-}" ]]; then
+  CONV_ID="$CONVERSATION_ID"
+elif [[ -z "$CONV_ID" && -n "${ZO_CONVERSATION_ID:-}" ]]; then
   CONV_ID="$ZO_CONVERSATION_ID"
 fi
 
 if [[ -z "$CONV_ID" ]]; then
   echo "Error: Could not detect conversation ID." >&2
-  echo "Run from /home/.z/workspaces/con_XXXXX/, set ZO_CONVERSATION_ID, or use --conv-id <id>" >&2
+  echo "Run from /home/.z/workspaces/con_XXXXX/, set CONVERSATION_ID, or use --conv-id <id>" >&2
   exit 1
 fi
 

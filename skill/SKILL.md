@@ -195,7 +195,7 @@ This runs before chunking, so no special handling is needed by the agent.
 
 The `zo-discord` CLI auto-detects the conversation ID from:
 1. The workspace path (`/home/.z/workspaces/con_XXXXX/...`)
-2. The `ZO_CONVERSATION_ID` environment variable
+2. The `CONVERSATION_ID` environment variable (falls back to `ZO_CONVERSATION_ID`)
 3. An explicit `--conv-id <id>` flag
 
 It calls `POST /conversations/{conv_id}/action`, which resolves the Discord thread ID internally. No thread ID needed.
