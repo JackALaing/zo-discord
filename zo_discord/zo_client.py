@@ -179,6 +179,8 @@ class ZoClient:
                         flushed_buffer = ""  # tracks what was already sent as thinking
                         last_flush_time = time.monotonic()
                         in_text_part = False
+                        in_thinking_part = False
+                        thinking_buffer = ""
                         current_event_type = ""
 
                         try:
@@ -219,6 +221,14 @@ class ZoClient:
                                                 if text_buffer and not text_buffer.endswith("\n"):
                                                     text_buffer += "\n\n"
                                                 text_buffer += initial_content
+                                        elif part_kind == "thinking":
+                                            # Thinking/reasoning part — accumulate deltas,
+                                            # flush on PartEndEvent. Zo streams thinking as
+                                            # small deltas (first token in PartStart, rest
+                                            # in PartDelta). Hermes sends full text in
+                                            # PartStart with no deltas.
+                                            in_thinking_part = True
+                                            thinking_buffer = part.get("content", "")
                                         elif part_kind == "builtin-tool-call":
                                             in_text_part = False
                                             if on_thinking and text_buffer.strip():
@@ -234,12 +244,19 @@ class ZoClient:
 
                                     elif current_event_type == "PartDeltaEvent":
                                         delta = event.get("delta", {})
-                                        if delta.get("part_delta_kind") == "text":
+                                        delta_kind = delta.get("part_delta_kind", "")
+                                        if delta_kind == "text":
                                             text = delta.get("content_delta", "")
                                             if in_text_part:
                                                 text_buffer += text
+                                        elif delta_kind == "thinking":
+                                            thinking_buffer += delta.get("content_delta", "")
 
                                     elif current_event_type == "PartEndEvent":
+                                        if in_thinking_part and on_thinking and thinking_buffer.strip():
+                                            await on_thinking(thinking_buffer.strip())
+                                            thinking_buffer = ""
+                                        in_thinking_part = False
                                         in_text_part = False
 
                                     elif current_event_type == "SSEErrorEvent":
