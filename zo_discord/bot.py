@@ -226,6 +226,7 @@ class ZoDiscordBot(commands.Bot):
         self._inflight = {}  # thread_id -> {"conv_id": str, "task": asyncio.Task}
         self._message_queues = {}  # thread_id -> asyncio.Queue of discord.Message
         self._bundled_prefixes = {}  # message.id -> str, for passing context to handle_thread_message
+        self._presaved_attachments = {}  # message.id -> list[str], pre-saved attachment paths
         self._thinking_mode = self.config.get("thinking_mode", "streaming")
         self._auto_archive_override = self.config.get("auto_archive_override", True)
 
@@ -518,7 +519,7 @@ class ZoDiscordBot(commands.Bot):
                 except Exception as e:
                     logger.error(f"Failed to save buffered attachment: {e}")
             if saved:
-                message._presaved_attachments = saved
+                self._presaved_attachments[message.id] = saved
 
         if key not in self._buffer:
             self._buffer[key] = []
@@ -789,7 +790,7 @@ class ZoDiscordBot(commands.Bot):
             combined_parts.append(text)
 
             # Use pre-saved attachments from buffer or save now
-            att_paths = getattr(msg, "_presaved_attachments", None) or []
+            att_paths = self._presaved_attachments.pop(msg.id, None) or []
             if not att_paths and msg.attachments:
                 att_dir = get_attachments_dir(channel.name)
                 for att in msg.attachments:
@@ -924,7 +925,7 @@ class ZoDiscordBot(commands.Bot):
                     except Exception as e:
                         logger.error(f"Failed to save queued attachment: {e}")
                 if saved_paths:
-                    message._presaved_attachments = saved_paths
+                    self._presaved_attachments[message.id] = saved_paths
             if thread_id not in self._message_queues:
                 self._message_queues[thread_id] = asyncio.Queue()
             await self._message_queues[thread_id].put(message)
@@ -971,7 +972,7 @@ class ZoDiscordBot(commands.Bot):
 
         # Use pre-saved attachments if this message was queued (CDN URLs may
         # have expired), otherwise download them now.
-        attachment_paths = getattr(message, "_presaved_attachments", None) or []
+        attachment_paths = self._presaved_attachments.pop(message.id, None) or []
         if not attachment_paths and message.attachments:
             channel_name = self._get_channel_name_for_thread(thread)
             att_dir = get_attachments_dir(channel_name)
