@@ -70,6 +70,12 @@ async def init_db():
             await db.execute("ALTER TABLE channel_config ADD COLUMN backend TEXT DEFAULT NULL")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE thread_mappings ADD COLUMN processing INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        # Clear stale processing flags from previous runs
+        await db.execute("UPDATE thread_mappings SET processing = 0 WHERE processing = 1")
         await db.commit()
 
 
@@ -272,6 +278,38 @@ async def is_watched(thread_id: str) -> bool:
         )
         row = await cursor.fetchone()
         return bool(row[0]) if row else False
+
+
+async def set_processing(thread_id: str, value: bool):
+    """Mark a thread as currently being processed (agent is running)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE thread_mappings SET processing = ? WHERE thread_id = ?",
+            (1 if value else 0, thread_id)
+        )
+        await db.commit()
+
+
+async def get_processing_conversation() -> tuple[str | None, str | None]:
+    """Find the conversation ID for the currently-processing thread.
+
+    Returns (conv_id, error_message). Exactly one must be set.
+    - If one thread is processing: returns (conv_id, None)
+    - If zero: returns (None, "No active conversations")
+    - If multiple: returns (None, "Multiple active conversations (...), specify --conv-id")
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT conversation_id FROM thread_mappings WHERE processing = 1 AND conversation_id != ''"
+        )
+        rows = await cursor.fetchall()
+        if len(rows) == 1:
+            return rows[0][0], None
+        elif len(rows) == 0:
+            return None, "No active conversations"
+        else:
+            ids = ", ".join(r[0] for r in rows)
+            return None, f"Multiple active conversations ({ids}), specify --conv-id"
 
 
 async def get_all_watched_threads() -> list[dict]:

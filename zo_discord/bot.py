@@ -25,7 +25,8 @@ from zo_discord.db import (
     get_active_threads, update_thread_name, update_conversation_id,
     get_channel_config, set_channel_config, delete_channel_config,
     update_thread_status, get_thread_status, get_mapping_by_conversation,
-    set_watched, is_watched, get_all_watched_threads
+    set_watched, is_watched, get_all_watched_threads,
+    set_processing, get_processing_conversation,
 )
 from zo_discord.zo_client import ZoClient, load_config
 from zo_discord.commands import setup_commands
@@ -158,6 +159,7 @@ class ButtonCallbackView(ui.View):
 
                     task = asyncio.current_task()
                     self.bot._inflight[self.thread_id] = {"conv_id": conv_id, "task": task}
+                    await set_processing(self.thread_id, True)
 
                     stop_event = asyncio.Event()
                     typing_task = asyncio.create_task(self.bot.typing_loop(thread, stop_event))
@@ -197,6 +199,7 @@ class ButtonCallbackView(ui.View):
                         await self.bot.set_status(thread, "error")
                     finally:
                         self.bot._inflight.pop(self.thread_id, None)
+                        await set_processing(self.thread_id, False)
                         stop_event.set()
                         await typing_task
         return callback
@@ -699,6 +702,7 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": "", "task": task}
+        await set_processing(thread_id, True)
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
@@ -760,6 +764,7 @@ class ZoDiscordBot(commands.Bot):
                 pass
         finally:
             self._inflight.pop(thread_id, None)
+            await set_processing(thread_id, False)
             stop_event.set()
             try:
                 await typing_task
@@ -837,6 +842,7 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": "", "task": task}
+        await set_processing(thread_id, True)
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
@@ -894,6 +900,7 @@ class ZoDiscordBot(commands.Bot):
                 pass
         finally:
             self._inflight.pop(thread_id, None)
+            await set_processing(thread_id, False)
             stop_event.set()
             try:
                 await typing_task
@@ -1030,6 +1037,7 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": conv_id or "", "task": task}
+        await set_processing(thread_id, True)
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
@@ -1146,6 +1154,7 @@ class ZoDiscordBot(commands.Bot):
                 await self.set_status(thread, "error")
         finally:
             self._inflight.pop(thread_id, None)
+            await set_processing(thread_id, False)
             stop_event.set()
             try:
                 await typing_task
@@ -1391,6 +1400,21 @@ class ZoDiscordBot(commands.Bot):
                 return None
         return thread if isinstance(thread, discord.Thread) else None
 
+    async def resolve_conv_id_from_request(self, request: web.Request) -> tuple[str | None, web.Response | None]:
+        """Extract conv_id from request path, auto-resolving 'auto' via the database.
+
+        Uses the `processing` flag in thread_mappings to find the active conversation.
+        Returns (conv_id, error_response). If conv_id is set, error_response is None.
+        """
+        conv_id = request.match_info["conv_id"]
+        if conv_id != "auto":
+            return conv_id, None
+        resolved, err = await get_processing_conversation()
+        if resolved:
+            return resolved, None
+        status = 404 if "No active" in err else 409
+        return None, web.json_response({"error": err}, status=status)
+
     # ─── HTTP Server ──────────────────────────────────────────────────────
 
     async def start_http_server(self):
@@ -1474,6 +1498,11 @@ class ZoDiscordBot(commands.Bot):
             title = data.get("title", "Notification")[:100]
             content = data.get("content", "")
             conversation_id = data.get("conversation_id", "")
+
+            # Auto-resolve conversation ID from active processing flag in DB
+            if conversation_id == "auto":
+                resolved, _ = await get_processing_conversation()
+                conversation_id = resolved or ""
 
             # Reject if this conversation already has a linked Discord thread
             if conversation_id:
@@ -1890,7 +1919,9 @@ class ZoDiscordBot(commands.Bot):
         {"action": "error|complete"}
         {"action": "send", "content": "message"}
         """
-        conv_id = request.match_info["conv_id"]
+        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
+        if err_resp is not None:
+            return err_resp
         try:
             data = await request.json()
             action = data.get("action")
@@ -1964,7 +1995,9 @@ class ZoDiscordBot(commands.Bot):
             "message": "Optional text"
         }
         """
-        conv_id = request.match_info["conv_id"]
+        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
+        if err_resp is not None:
+            return err_resp
         try:
             data = await request.json()
             file_path = Path(data.get("file_path", ""))
@@ -2013,7 +2046,9 @@ class ZoDiscordBot(commands.Bot):
             "channel_name": "optional — resolve by name instead of ID"
         }
         """
-        conv_id = request.match_info["conv_id"]
+        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
+        if err_resp is not None:
+            return err_resp
         try:
             data = await request.json()
             title = data.get("title", "New Thread")[:100]
@@ -2122,7 +2157,9 @@ class ZoDiscordBot(commands.Bot):
             "preset": "approve_reject"  // optional, overrides buttons
         }
         """
-        conv_id = request.match_info["conv_id"]
+        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
+        if err_resp is not None:
+            return err_resp
         try:
             data = await request.json()
 

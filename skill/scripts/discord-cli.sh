@@ -70,10 +70,10 @@ elif [[ -z "$CONV_ID" && -n "${ZO_CONVERSATION_ID:-}" ]]; then
   CONV_ID="$ZO_CONVERSATION_ID"
 fi
 
+
+# 4. Fallback: let the bot auto-resolve from in-flight conversations
 if [[ -z "$CONV_ID" ]]; then
-  echo "Error: Could not detect conversation ID." >&2
-  echo "Run from /home/.z/workspaces/con_XXXXX/, set CONVERSATION_ID, or use --conv-id <id>" >&2
-  exit 1
+  CONV_ID="auto"
 fi
 
 case "$CMD" in
