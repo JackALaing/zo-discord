@@ -150,7 +150,7 @@ cp -r skill/ /home/workspace/Skills/zo-discord/
 
 ## CLI Reference
 
-The `zo-discord` CLI detects the conversation ID via: (1) `--conv-id` flag (injected into Zo's context by the bot), or (2) `CONVERSATION_ID` / `ZO_CONVERSATION_ID` env vars (set by Hermes agents). No manual thread ID needed.
+The `zo-discord` CLI detects the conversation ID via: (1) `--conv-id` flag (injected into Zo's context by the bot), or (2) `CONVERSATION_ID` / `ZO_CONVERSATION_ID` env vars (automatically set by the Hermes backend only). No manual thread ID needed.
 
 ```
 zo-discord --conv-id <id> rename "Title"               — Rename the thread
