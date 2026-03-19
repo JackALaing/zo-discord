@@ -164,8 +164,9 @@ class ButtonCallbackView(ui.View):
                     try:
                         choice_msg = f"[Button pressed: {label} (id: {button_id})]"
                         btn_backend = None
+                        btn_hermes_params = {}
                         if thread.parent:
-                            _, _, btn_backend = await self.bot.resolve_channel_defaults(str(thread.parent.id))
+                            _, _, btn_backend, btn_hermes_params = await self.bot.resolve_channel_defaults(str(thread.parent.id))
                         context, file_paths = await self.bot.build_thread_context(thread, include_source=False, conv_id=conv_id, backend=btn_backend or "")
                         result = await self.bot.zo.ask_stream(
                             choice_msg,
@@ -174,6 +175,7 @@ class ButtonCallbackView(ui.View):
                             file_paths=file_paths or None,
                             on_thinking=on_thinking,
                             on_conv_id=on_conv_id,
+                            **btn_hermes_params,
                         )
                         response, new_conv_id = result.output, result.conv_id
                         if new_conv_id != conv_id:
@@ -285,15 +287,28 @@ class ZoDiscordBot(commands.Bot):
             return float(ch_config["buffer_seconds"])
         return float(self.config.get("buffer_seconds", 0))
 
-    async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None, str | None]:
-        """Get the effective model, persona, and backend for a channel.
+    async def resolve_channel_defaults(self, channel_id: str) -> tuple[str | None, str | None, str | None, dict]:
+        """Get the effective model, persona, backend, and hermes params for a channel.
 
-        Returns (model_id_or_none, persona_id_or_none, backend_or_none) from channel_config.
+        Returns (model_id_or_none, persona_id_or_none, backend_or_none, hermes_params_dict) from channel_config.
         """
         ch_config = await get_channel_config(channel_id)
         if not ch_config:
-            return None, None, None
-        return ch_config.get("model"), ch_config.get("persona_id"), ch_config.get("backend")
+            return None, None, None, {}
+        hermes_params = {}
+        if ch_config.get("reasoning"):
+            hermes_params["reasoning_effort"] = ch_config["reasoning"]
+        if ch_config.get("max_iterations"):
+            hermes_params["max_iterations"] = ch_config["max_iterations"]
+        if ch_config.get("skip_memory"):
+            hermes_params["skip_memory"] = True
+        if ch_config.get("skip_context"):
+            hermes_params["skip_context"] = True
+        if ch_config.get("enabled_toolsets"):
+            hermes_params["enabled_toolsets"] = ch_config["enabled_toolsets"]
+        if ch_config.get("disabled_toolsets"):
+            hermes_params["disabled_toolsets"] = ch_config["disabled_toolsets"]
+        return ch_config.get("model"), ch_config.get("persona_id"), ch_config.get("backend"), hermes_params
 
     async def on_ready(self):
         if not self._initialized:
@@ -658,8 +673,8 @@ class ZoDiscordBot(commands.Bot):
         if persona_override:
             logger.info(f"Persona override detected: {persona_override}")
 
-        # Resolve channel defaults (model, persona, backend)
-        channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(message.channel.id))
+        # Resolve channel defaults (model, persona, backend, hermes params)
+        channel_model, channel_persona, channel_backend, channel_hermes_params = await self.resolve_channel_defaults(str(message.channel.id))
 
         # Priority: message prefix > channel default > global default
         effective_model = model_override or channel_model  # global default handled by ZoClient
@@ -719,6 +734,7 @@ class ZoDiscordBot(commands.Bot):
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
+                **channel_hermes_params,
             )
             response, conv_id = result.output, result.conv_id
 
@@ -813,7 +829,7 @@ class ZoDiscordBot(commands.Bot):
         user_text = "\n".join(combined_parts)
 
         # Resolve channel defaults
-        channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(channel.id))
+        channel_model, channel_persona, channel_backend, channel_hermes_params = await self.resolve_channel_defaults(str(channel.id))
         effective_model = effective_model or channel_model
         config = load_config()
         effective_persona = effective_persona or channel_persona or config.get("default_persona")
@@ -856,6 +872,7 @@ class ZoDiscordBot(commands.Bot):
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
+                **channel_hermes_params,
             )
             response, conv_id = result.output, result.conv_id
 
@@ -959,8 +976,9 @@ class ZoDiscordBot(commands.Bot):
         effective_model = model_override
         effective_persona = persona_override
         channel_backend = None
+        channel_hermes_params = {}
         if parent_channel_id:
-            channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(parent_channel_id)
+            channel_model, channel_persona, channel_backend, channel_hermes_params = await self.resolve_channel_defaults(parent_channel_id)
             if not conv_id:
                 if not effective_model:
                     effective_model = channel_model
@@ -1047,6 +1065,7 @@ class ZoDiscordBot(commands.Bot):
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
+                **channel_hermes_params,
             )
             response, new_conv_id = result.output, result.conv_id
 
@@ -2073,7 +2092,7 @@ class ZoDiscordBot(commands.Bot):
             )
 
             # Resolve channel model/persona defaults
-            channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(channel.id))
+            channel_model, channel_persona, channel_backend, channel_hermes_params = await self.resolve_channel_defaults(str(channel.id))
 
             context, file_paths = await self.build_channel_context(channel, include_source=True, thread=thread, backend=channel_backend or "")
             config = load_config()
@@ -2095,6 +2114,7 @@ class ZoDiscordBot(commands.Bot):
                 model_name=channel_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
+                **channel_hermes_params,
             )
             response, new_conv_id = result.output, result.conv_id
 

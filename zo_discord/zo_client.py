@@ -95,6 +95,12 @@ class ZoClient:
         model_name: str = None,
         persona_id: str = None,
         backend: str = None,
+        reasoning_effort: str = None,
+        max_iterations: int = None,
+        skip_memory: bool = False,
+        skip_context: bool = False,
+        enabled_toolsets: list[str] = None,
+        disabled_toolsets: list[str] = None,
     ) -> StreamResult:
         """
         Send a message to Zo or Hermes via streaming endpoint.
@@ -130,11 +136,24 @@ class ZoClient:
             payload["conversation_id"] = conversation_id
         if persona_id:
             payload["persona_id"] = persona_id
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+        if max_iterations:
+            payload["max_iterations"] = max_iterations
+        if skip_memory:
+            payload["skip_memory"] = True
+        if skip_context:
+            payload["skip_context"] = True
+        if enabled_toolsets:
+            payload["enabled_toolsets"] = enabled_toolsets
+        if disabled_toolsets:
+            payload["disabled_toolsets"] = disabled_toolsets
 
         api_url, headers = get_request_config(self.api_key, backend, self.backend)
         backend_label = get_backend_label(backend, self.backend)
 
-        logger.info(f"Sending to {backend_label} API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}")
+        hermes_extras = {k: v for k, v in payload.items() if k in ("reasoning_effort", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets")}
+        logger.info(f"Sending to {backend_label} API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}" + (f", hermes_params: {hermes_extras}" if hermes_extras else ""))
 
         timeout = aiohttp.ClientTimeout(total=1800)
         conv_id = conversation_id or ""

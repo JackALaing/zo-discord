@@ -70,6 +70,30 @@ async def init_db():
             await db.execute("ALTER TABLE channel_config ADD COLUMN backend TEXT DEFAULT NULL")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN reasoning TEXT DEFAULT NULL")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN max_iterations INTEGER DEFAULT NULL")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN skip_memory BOOLEAN DEFAULT FALSE")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN skip_context BOOLEAN DEFAULT FALSE")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN enabled_toolsets TEXT DEFAULT NULL")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN disabled_toolsets TEXT DEFAULT NULL")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -185,6 +209,8 @@ async def get_channel_config(channel_id: str) -> dict | None:
         config = dict(row)
         import json
         config["memory_paths"] = json.loads(config.get("memory_paths") or "[]")
+        config["enabled_toolsets"] = json.loads(config.get("enabled_toolsets") or "null")
+        config["disabled_toolsets"] = json.loads(config.get("disabled_toolsets") or "null")
         return config
 
 
@@ -196,12 +222,17 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
     
     if "memory_paths" in kwargs and isinstance(kwargs["memory_paths"], list):
         kwargs["memory_paths"] = json.dumps(kwargs["memory_paths"])
+    if "enabled_toolsets" in kwargs and isinstance(kwargs["enabled_toolsets"], list):
+        kwargs["enabled_toolsets"] = json.dumps(kwargs["enabled_toolsets"])
+    if "disabled_toolsets" in kwargs and isinstance(kwargs["disabled_toolsets"], list):
+        kwargs["disabled_toolsets"] = json.dumps(kwargs["disabled_toolsets"])
     
     async with aiosqlite.connect(DB_PATH) as db:
         if existing:
             sets = []
             vals = []
-            for key in ("instructions", "memory_paths", "persona_id", "model", "buffer_seconds", "backend"):
+            for key in ("instructions", "memory_paths", "persona_id", "model", "buffer_seconds", "backend",
+                        "reasoning", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets"):
                 if key in kwargs:
                     sets.append(f"{key} = ?")
                     vals.append(kwargs[key])
@@ -215,8 +246,9 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
                 )
         else:
             await db.execute("""
-                INSERT INTO channel_config (channel_id, instructions, memory_paths, persona_id, model, buffer_seconds, backend, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO channel_config (channel_id, instructions, memory_paths, persona_id, model, buffer_seconds, backend,
+                    reasoning, max_iterations, skip_memory, skip_context, enabled_toolsets, disabled_toolsets, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 channel_id,
                 kwargs.get("instructions"),
@@ -225,6 +257,12 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
                 kwargs.get("model"),
                 kwargs.get("buffer_seconds"),
                 kwargs.get("backend"),
+                kwargs.get("reasoning"),
+                kwargs.get("max_iterations"),
+                kwargs.get("skip_memory", False),
+                kwargs.get("skip_context", False),
+                kwargs.get("enabled_toolsets"),
+                kwargs.get("disabled_toolsets"),
                 now
             ))
         await db.commit()

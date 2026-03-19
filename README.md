@@ -22,6 +22,7 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 - **Models** — Set a default model globally or per-channel with `/model`. Define aliases to make model IDs easier to remember, and prefix a new conversation with `/alias` (e.g. `/opus`) to override the model for that thread.
 - **Personas** — Set a default persona globally or per-channel with `/persona`. Define aliases and prefix a new conversation with `@alias` (e.g. `@pirate`) to override for that thread.
 - **Channel instructions & memory** — Set custom instructions and memory file paths per-channel — they're injected into every conversation. Channel topic and pinned messages also provide context.
+- **Hermes channel config** — Per-channel overrides for Hermes-specific settings: `reasoning` (off/low/medium/high), `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`. Set via SQLite or the `/config` HTTP endpoint.
 - **Allowed users** — Restrict bot access to specific Discord users, or allow all users. Manage with `/allowed-users`.
 - **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`
 
@@ -329,8 +330,9 @@ All Hermes-specific logic lives in `zo_discord/hermes.py`:
 
 The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 
-- **`bot.py`**: `resolve_channel_defaults()` returns a third value (`backend`), which is threaded through to `ask_stream()` and `_retry_empty_response()` calls. No Hermes-specific logic in bot.py.
-- **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter but delegates all backend-specific decisions to the hermes module.
+- **`bot.py`**: `resolve_channel_defaults()` returns four values (`model`, `persona`, `backend`, `hermes_params`). The `hermes_params` dict is passed through to `ask_stream()` via `**kwargs`. No Hermes-specific logic in bot.py.
+- **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter plus Hermes-specific params (`reasoning_effort`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`) which are included in the API payload when set.
+- **`db.py`**: The `channel_config` table stores Hermes params alongside existing fields. `enabled_toolsets` and `disabled_toolsets` are stored as JSON strings and deserialized to lists on read.
 
 ### Dependencies
 
