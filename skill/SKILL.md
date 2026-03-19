@@ -11,7 +11,7 @@ Send notifications and control Discord interactions via the bot's HTTP API at `l
 
 ## CLI (recommended)
 
-The `zo-discord` CLI auto-detects your conversation ID from the workspace path. No thread ID needed.
+The `zo-discord` CLI routes by conversation ID. Prefer `--conv-id <id>` when available. Env-var fallback exists, but explicit `--conv-id` is the reliable path. No thread ID needed.
 
 ```bash
 zo-discord <command> [args]
@@ -193,9 +193,9 @@ This runs before chunking, so no special handling is needed by the agent.
 
 ## How the CLI Works
 
-The `zo-discord` CLI auto-detects the conversation ID from:
+The `zo-discord` CLI accepts the conversation ID from:
 1. An explicit `--conv-id <id>` flag (parsed first, before the command word)
-2. The `CONVERSATION_ID` environment variable (falls back to `ZO_CONVERSATION_ID`)
+2. The `CONVERSATION_ID` environment variable (falls back to `ZO_CONVERSATION_ID`) as a fallback only
 
 It calls `POST /conversations/{conv_id}/action`, which resolves the Discord thread ID internally. No thread ID needed.
 

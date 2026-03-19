@@ -848,14 +848,14 @@ def setup_commands(bot):
     @bot.slash_command(name="cli", description="Show zo-discord CLI commands available to Zo")
     async def cli_cmd(ctx: discord.ApplicationContext):
         await ctx.respond(
-            "**zo-discord CLI** (used by Zo, auto-detects conversation ID)\n\n"
-            '- `zo-discord rename "Title"` — Rename the thread\n'
-            "- `zo-discord error` — Set thread status to error\n"
+            "**zo-discord CLI** (prefer explicit `--conv-id`)\n\n"
+            '- `zo-discord --conv-id <id> rename "Title"` — Rename the thread\n'
+            "- `zo-discord --conv-id <id> error` — Set thread status to error\n"
             '- `zo-discord notify "Title" "content" --channel-name NAME` — Post to a new thread\n'
             "  - `--file /path/to/file` — Post file contents instead\n"
-            '- `zo-discord buttons "Prompt?" "Yes:success" "No:danger"` — Send interactive buttons\n'
+            '- `zo-discord --conv-id <id> buttons "Prompt?" "Yes:success" "No:danger"` — Send interactive buttons\n'
             "  - `--preset yes_no|approve_reject` — Use a preset\n"
-            '- `zo-discord new-thread "Title" "prompt"` — Spawn a new thread',
+            '- `zo-discord --conv-id <id> new-thread "Title" "prompt"` — Spawn a new thread',
             ephemeral=True,
         )
 

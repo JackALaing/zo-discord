@@ -1473,12 +1473,11 @@ class ZoDiscordBot(commands.Bot):
         channel_dir_str = str(channel_dir)
         channel_mention = "<#" + str(channel.id) + ">"
 
-        # Hermes agents have CONVERSATION_ID set as an env var by zo-hermes/server.py,
-        # so the CLI auto-resolves without --conv-id. Only Zo agents need the flag.
-        is_hermes = backend == "hermes"
-        conv_flag = f" --conv-id {conv_id}" if conv_id and not is_hermes else ""
-        if conv_id or is_hermes:
+        conv_flag = f" --conv-id {conv_id}" if conv_id else " --conv-id <session_id>"
+        if conv_id:
             conv_hint = ""
+        elif backend == "hermes":
+            conv_hint = " (use the Hermes session ID provided in your prompt; do not rely on auto-detection)"
         else:
             conv_hint = " (find your conversation ID in the <conversation_workspace> section of your system prompt)"
 

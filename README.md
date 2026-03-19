@@ -148,11 +148,11 @@ cp -r skill/ /home/workspace/Skills/zo-discord/
 3. Bot creates a thread with Zo's response
 4. Thread-to-conversation mapping is stored in SQLite
 5. Follow-up messages in the thread continue the same Zo session
-6. Scheduled Zo agents can use the CLI (with `--conv-id` or env vars) to spawn new Discord threads linked to their active session
+6. Scheduled Zo agents can use the CLI (prefer `--conv-id`) to spawn new Discord threads linked to their active session
 
 ## CLI Reference
 
-The `zo-discord` CLI detects the conversation ID via: (1) `--conv-id` flag (injected into Zo's context by the bot), or (2) `CONVERSATION_ID` / `ZO_CONVERSATION_ID` env vars (automatically set by the Hermes backend only). No manual thread ID needed.
+The `zo-discord` CLI accepts the conversation ID via: (1) `--conv-id` flag, which is the preferred and concurrency-safe path, or (2) `CONVERSATION_ID` / `ZO_CONVERSATION_ID` env vars as a fallback. No manual thread ID needed.
 
 ```
 zo-discord --conv-id <id> rename "Title"               — Rename the thread

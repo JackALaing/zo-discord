@@ -1,6 +1,6 @@
 #!/bin/bash
 # zo-discord CLI — control Discord threads from Zo conversations
-# Conversation ID: --conv-id flag (Zo agents) or CONVERSATION_ID env var (Hermes agents).
+# Prefer --conv-id explicitly. CONVERSATION_ID env vars are fallback only.
 #
 # Usage: zo-discord <command> [args...]
 #
@@ -52,12 +52,12 @@ Commands:
   new-thread <title> <prompt> [--channel-name NAME]  Spawn a new thread
 
 Channel targeting: use --channel-name <name> or --channel <id>
-Conv ID: pass --conv-id <id>, or set CONVERSATION_ID / ZO_CONVERSATION_ID env var
+Conv ID: prefer --conv-id <id>; CONVERSATION_ID / ZO_CONVERSATION_ID are fallback only
 HELP
   exit 0
 fi
 
-# 2. CONVERSATION_ID env var (Hermes agents get this from zo-hermes/server.py)
+# 2. CONVERSATION_ID env var fallback
 if [[ -z "$CONV_ID" && -n "${CONVERSATION_ID:-}" ]]; then
   CONV_ID="$CONVERSATION_ID"
 elif [[ -z "$CONV_ID" && -n "${ZO_CONVERSATION_ID:-}" ]]; then
