@@ -1447,6 +1447,7 @@ class ZoDiscordBot(commands.Bot):
         self.http_app.router.add_post("/conversations/{conv_id}/action", self.handle_conversation_action)
         self.http_app.router.add_post("/conversations/{conv_id}/files", self.handle_conversation_files)
         self.http_app.router.add_post("/conversations/{conv_id}/new-thread", self.handle_new_thread)
+        self.http_app.router.add_post("/config", self.handle_config)
 
         port = self.config.get("notification_port", 8787)
 
@@ -2197,6 +2198,24 @@ class ZoDiscordBot(commands.Bot):
 
         except Exception as e:
             logger.error(f"Conversation buttons error: {e}", exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def handle_config(self, request: web.Request) -> web.Response:
+        """Simple config endpoint for agents. Accepts channel_id in body.
+
+        POST /config
+        {"channel_id": "123", "reasoning": "high", "skip_memory": true, ...}
+        """
+        try:
+            data = await request.json()
+            channel_id = data.pop("channel_id", None)
+            if not channel_id:
+                return web.json_response({"error": "channel_id is required"}, status=400)
+            await set_channel_config(str(channel_id), **data)
+            config = await get_channel_config(str(channel_id))
+            return web.json_response({"success": True, "config": config})
+        except Exception as e:
+            logger.error(f"Config endpoint error: {e}")
             return web.json_response({"error": str(e)}, status=500)
 
     async def handle_get_channel_config(self, request: web.Request) -> web.Response:

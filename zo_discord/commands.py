@@ -7,11 +7,20 @@ import os
 from pathlib import Path
 
 import discord
+import yaml
 from discord import ui
 from zo_discord import PROJECT_ROOT
 from zo_discord.db import get_channel_config, set_channel_config, get_conversation_id
 from zo_discord.hermes import is_hermes
 from zo_discord.zo_client import load_config
+
+HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
+
+AVAILABLE_TOOLSETS = [
+    "web", "terminal", "file", "browser", "vision", "image_gen",
+    "skills", "skills_hub", "moa", "todo", "tts", "cronjob", "rl",
+    "all", "debugging", "safe",
+]
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 
@@ -45,6 +54,28 @@ def _save_config_key(key: str, value):
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
         f.write("\n")
+
+
+def _get_parent_channel(ctx: discord.ApplicationContext):
+    """Get the parent channel (resolves threads to their parent)."""
+    channel = ctx.channel
+    if isinstance(channel, discord.Thread) and channel.parent:
+        channel = channel.parent
+    return channel
+
+
+def _read_hermes_config() -> dict:
+    """Read ~/.hermes/config.yaml."""
+    if not HERMES_CONFIG_PATH.exists():
+        return {}
+    with open(HERMES_CONFIG_PATH) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _write_hermes_config(data: dict):
+    """Write ~/.hermes/config.yaml."""
+    with open(HERMES_CONFIG_PATH, "w") as f:
+        yaml.dump(data, f, default_flow_style=False)
 
 TIPS = [
     "zo-discord supports **message queuing**. Send multiple messages while Zo is thinking — they'll be batched into one message when the current turn finishes.",
@@ -479,6 +510,19 @@ def setup_commands(bot):
         lines.append("`/memory` — View channel memory paths")
         lines.append("`/allowed-users` — Manage allowed users")
         lines.append("`/cli` — Show CLI commands")
+        lines.append("")
+        lines.append("**Hermes Config**")
+        lines.append("`/reasoning` — Set reasoning effort (off/low/medium/high)")
+        lines.append("`/tools` — View enabled/disabled toolsets")
+        lines.append("`/max-iterations` — Set max agent iterations")
+        lines.append("`/skip-memory` — Toggle memory skip")
+        lines.append("`/skip-context` — Toggle context skip")
+        lines.append("`/compression-threshold` — Set compression threshold")
+
+        help_channel = _get_parent_channel(ctx)
+        help_ch_config = await get_channel_config(str(help_channel.id))
+        msg_mode = help_ch_config.get("message_mode", "queue") if help_ch_config else "queue"
+        lines.append(f"`/queue` / `/interrupt` — message mode (currently: {msg_mode})")
 
         await ctx.respond("\n".join(lines), ephemeral=True)
 
@@ -755,5 +799,148 @@ def setup_commands(bot):
             '- `zo-discord buttons "Prompt?" "Yes:success" "No:danger"` — Send interactive buttons\n'
             "  - `--preset yes_no|approve_reject` — Use a preset\n"
             '- `zo-discord new-thread "Title" "prompt"` — Spawn a new thread',
+            ephemeral=True,
+        )
+
+    # --- Channel config slash commands ---
+
+    @bot.slash_command(name="reasoning", description="Set reasoning effort for this channel")
+    async def reasoning_cmd(
+        ctx: discord.ApplicationContext,
+        level: discord.Option(
+            str,
+            description="Reasoning effort level",
+            choices=["off", "low", "medium", "high"],
+            required=False,
+        ) = None,
+    ):
+        channel = _get_parent_channel(ctx)
+        channel_id = str(channel.id)
+        ch_config = await get_channel_config(channel_id)
+        current = ch_config.get("reasoning") if ch_config else None
+
+        if level is None:
+            display = current or "Not set (using default)"
+            await ctx.respond(f"**Reasoning effort:** {display}", ephemeral=True)
+            return
+
+        await set_channel_config(channel_id, reasoning=level)
+        await ctx.respond(f"Reasoning effort set to **{level}** for #{channel.name}.", ephemeral=True)
+
+    @bot.slash_command(name="tools", description="View enabled/disabled toolsets for this channel")
+    async def tools_cmd(ctx: discord.ApplicationContext):
+        channel = _get_parent_channel(ctx)
+        channel_id = str(channel.id)
+        ch_config = await get_channel_config(channel_id)
+
+        enabled = ch_config.get("enabled_toolsets") if ch_config else None
+        disabled = ch_config.get("disabled_toolsets") if ch_config else None
+
+        lines = [f"**Toolsets for #{channel.name}:**"]
+        if enabled:
+            lines.append(f"Enabled: `{', '.join(enabled)}`")
+        else:
+            lines.append("Enabled: all (default)")
+        if disabled:
+            lines.append(f"Disabled: `{', '.join(disabled)}`")
+        else:
+            lines.append("Disabled: none")
+
+        lines.append("")
+        lines.append(f"Available: `{', '.join(AVAILABLE_TOOLSETS)}`")
+        lines.append("")
+        lines.append("*Ask the agent to change tools conversationally — it can update them via the config API.*")
+
+        await ctx.respond("\n".join(lines), ephemeral=True)
+
+    @bot.slash_command(name="max-iterations", description="Set max iterations for this channel")
+    async def max_iterations_cmd(
+        ctx: discord.ApplicationContext,
+        value: discord.Option(int, description="Max iterations (blank to view current)", required=False) = None,
+    ):
+        channel = _get_parent_channel(ctx)
+        channel_id = str(channel.id)
+        ch_config = await get_channel_config(channel_id)
+        current = ch_config.get("max_iterations") if ch_config else None
+
+        hermes_cfg = _read_hermes_config()
+        global_default = hermes_cfg.get("agent", {}).get("max_turns", 200)
+
+        if value is None:
+            display = str(current) if current is not None else f"Not set (global default: {global_default})"
+            await ctx.respond(f"**Max iterations:** {display}", ephemeral=True)
+            return
+
+        if value < 1:
+            await ctx.respond("Value must be at least 1.", ephemeral=True)
+            return
+
+        await set_channel_config(channel_id, max_iterations=value)
+        await ctx.respond(f"Max iterations set to **{value}** for #{channel.name}. (Global default: {global_default})", ephemeral=True)
+
+    @bot.slash_command(name="skip-memory", description="Toggle memory skip for this channel")
+    async def skip_memory_cmd(ctx: discord.ApplicationContext):
+        channel = _get_parent_channel(ctx)
+        channel_id = str(channel.id)
+        ch_config = await get_channel_config(channel_id)
+        current = bool(ch_config.get("skip_memory")) if ch_config else False
+
+        new_value = not current
+        await set_channel_config(channel_id, skip_memory=new_value)
+        state = "on" if new_value else "off"
+        await ctx.respond(f"**Skip memory:** {state} for #{channel.name}.", ephemeral=True)
+
+    @bot.slash_command(name="skip-context", description="Toggle context skip for this channel")
+    async def skip_context_cmd(ctx: discord.ApplicationContext):
+        channel = _get_parent_channel(ctx)
+        channel_id = str(channel.id)
+        ch_config = await get_channel_config(channel_id)
+        current = bool(ch_config.get("skip_context")) if ch_config else False
+
+        new_value = not current
+        await set_channel_config(channel_id, skip_context=new_value)
+        state = "on" if new_value else "off"
+        await ctx.respond(f"**Skip context:** {state} for #{channel.name}.", ephemeral=True)
+
+    # --- Global config command ---
+
+    @bot.slash_command(name="compression-threshold", description="View/set Hermes compression threshold")
+    async def compression_threshold_cmd(
+        ctx: discord.ApplicationContext,
+        value: discord.Option(float, description="Threshold (0.0-1.0, blank to view)", required=False) = None,
+    ):
+        hermes_cfg = _read_hermes_config()
+        current = hermes_cfg.get("compression", {}).get("threshold")
+
+        if value is None:
+            display = str(current) if current is not None else "Not set"
+            await ctx.respond(f"**Compression threshold:** {display}", ephemeral=True)
+            return
+
+        if not (0.0 <= value <= 1.0):
+            await ctx.respond("Value must be between 0.0 and 1.0.", ephemeral=True)
+            return
+
+        hermes_cfg.setdefault("compression", {})["threshold"] = value
+        _write_hermes_config(hermes_cfg)
+        await ctx.respond(f"Compression threshold set to **{value}**.", ephemeral=True)
+
+    # --- Message mode commands ---
+
+    @bot.slash_command(name="queue", description="Set message mode to queue (batch messages)")
+    async def queue_cmd(ctx: discord.ApplicationContext):
+        channel = _get_parent_channel(ctx)
+        await set_channel_config(str(channel.id), message_mode="queue")
+        await ctx.respond(
+            "📥 **Queue mode** — messages will be batched and sent after the agent finishes. Use `/interrupt` to switch.",
+            ephemeral=True,
+        )
+
+    @bot.slash_command(name="interrupt", description="Set message mode to interrupt (cancel current turn)")
+    async def interrupt_cmd(ctx: discord.ApplicationContext):
+        channel = _get_parent_channel(ctx)
+        await set_channel_config(str(channel.id), message_mode="interrupt")
+        await ctx.respond(
+            "⚡ **Interrupt mode** — messages will cancel the current turn and be injected immediately. Use `/queue` to switch.",
             ephemeral=True,
         )

@@ -24,7 +24,7 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 - **Channel instructions & memory** — Set custom instructions and memory file paths per-channel — they're injected into every conversation. Channel topic and pinned messages also provide context.
 - **Hermes channel config** — Per-channel overrides for Hermes-specific settings: `reasoning` (off/low/medium/high), `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`. Set via SQLite or the `/config` HTTP endpoint.
 - **Allowed users** — Restrict bot access to specific Discord users, or allow all users. Manage with `/allowed-users`.
-- **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`
+- **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`, `/reasoning`, `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, `/interrupt`
 
 ### Scheduled Agents
 - **Notifications** — Scheduled Zo agents can post results to new Discord threads with session continuity, so you can reply and continue the conversation. See `skill/scheduled-agent-example.md`.
@@ -188,6 +188,15 @@ All settings changed via slash commands are persisted to `config.json` and survi
 | `/memory` | View channel memory paths |
 | `/allowed-users` | Manage allowed users |
 | `/cli` | Show CLI commands |
+| `/reasoning` | Set reasoning effort (off/low/medium/high) per-channel |
+| `/tools` | View enabled/disabled toolsets for this channel |
+| `/max-iterations` | Set max agent iterations per-channel |
+| `/skip-memory` | Toggle memory skip per-channel |
+| `/skip-context` | Toggle context skip per-channel |
+| `/compression-threshold` | View/set Hermes compression threshold (global) |
+| `/queue` | Set message mode to queue (batch messages) |
+| `/interrupt` | Set message mode to interrupt (cancel current turn) |
+| `/backend` | View/change backend (Zo/Hermes) |
 
 ## Per-Thread Model Override
 
@@ -330,7 +339,7 @@ All Hermes-specific logic lives in `zo_discord/hermes.py`:
 
 The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 
-- **`bot.py`**: `resolve_channel_defaults()` returns four values (`model`, `persona`, `backend`, `hermes_params`). The `hermes_params` dict is passed through to `ask_stream()` via `**kwargs`. No Hermes-specific logic in bot.py.
+- **`bot.py`**: `resolve_channel_defaults()` returns four values (`model`, `persona`, `backend`, `hermes_params`). The `hermes_params` dict is passed through to `ask_stream()` via `**kwargs`. The HTTP server exposes `POST /config` for agent-driven config updates (`{"channel_id": "...", "key": "value"}`).
 - **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter plus Hermes-specific params (`reasoning_effort`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`) which are included in the API payload when set.
 - **`db.py`**: The `channel_config` table stores Hermes params alongside existing fields. `enabled_toolsets` and `disabled_toolsets` are stored as JSON strings and deserialized to lists on read.
 

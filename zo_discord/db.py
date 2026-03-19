@@ -94,6 +94,10 @@ async def init_db():
             await db.execute("ALTER TABLE channel_config ADD COLUMN disabled_toolsets TEXT DEFAULT NULL")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE channel_config ADD COLUMN message_mode TEXT DEFAULT 'queue'")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -232,7 +236,8 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
             sets = []
             vals = []
             for key in ("instructions", "memory_paths", "persona_id", "model", "buffer_seconds", "backend",
-                        "reasoning", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets"):
+                        "reasoning", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets",
+                        "message_mode"):
                 if key in kwargs:
                     sets.append(f"{key} = ?")
                     vals.append(kwargs[key])
@@ -247,8 +252,8 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
         else:
             await db.execute("""
                 INSERT INTO channel_config (channel_id, instructions, memory_paths, persona_id, model, buffer_seconds, backend,
-                    reasoning, max_iterations, skip_memory, skip_context, enabled_toolsets, disabled_toolsets, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    reasoning, max_iterations, skip_memory, skip_context, enabled_toolsets, disabled_toolsets, message_mode, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 channel_id,
                 kwargs.get("instructions"),
@@ -263,6 +268,7 @@ async def set_channel_config(channel_id: str, **kwargs) -> None:
                 kwargs.get("skip_context", False),
                 kwargs.get("enabled_toolsets"),
                 kwargs.get("disabled_toolsets"),
+                kwargs.get("message_mode", "queue"),
                 now
             ))
         await db.commit()
