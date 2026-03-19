@@ -169,7 +169,6 @@ class ButtonCallbackView(ui.View):
                         if thread.parent:
                             _, _, btn_backend, btn_hermes_params = await self.bot.resolve_channel_defaults(str(thread.parent.id))
                         on_clarify = self.bot.make_on_clarify(thread) if btn_backend == "hermes" else None
-                        on_progress = self.bot.make_on_progress(thread) if btn_backend == "hermes" else None
                         context, file_paths = await self.bot.build_thread_context(thread, include_source=False, conv_id=conv_id, backend=btn_backend or "")
                         result = await self.bot.zo.ask_stream(
                             choice_msg,
@@ -179,7 +178,6 @@ class ButtonCallbackView(ui.View):
                             on_thinking=on_thinking,
                             on_conv_id=on_conv_id,
                             on_clarify=on_clarify,
-                            on_progress=on_progress,
                             **btn_hermes_params,
                         )
                         response, new_conv_id = result.output, result.conv_id
@@ -745,8 +743,6 @@ class ZoDiscordBot(commands.Bot):
                 file_paths.extend(attachment_paths)
 
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
-            on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
-
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
@@ -754,7 +750,6 @@ class ZoDiscordBot(commands.Bot):
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
                 on_clarify=on_clarify,
-                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -888,8 +883,6 @@ class ZoDiscordBot(commands.Bot):
             file_paths.extend(all_attachment_paths)
 
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
-            on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
-
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
@@ -897,7 +890,6 @@ class ZoDiscordBot(commands.Bot):
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
                 on_clarify=on_clarify,
-                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -1129,8 +1121,6 @@ class ZoDiscordBot(commands.Bot):
 
         on_thinking = self.make_on_thinking(thread)
         on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
-        on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
-
         async def on_conv_id(cid: str):
             if cid != conv_id:
                 await update_conversation_id(thread_id, cid)
@@ -1154,7 +1144,6 @@ class ZoDiscordBot(commands.Bot):
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
                 on_clarify=on_clarify,
-                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -1293,8 +1282,6 @@ class ZoDiscordBot(commands.Bot):
 
         on_thinking = self.make_on_thinking(thread)
         on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
-        on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
-
         async def on_conv_id(cid: str):
             if cid != conv_id:
                 await update_conversation_id(thread_id, cid)
@@ -1315,7 +1302,6 @@ class ZoDiscordBot(commands.Bot):
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
                 on_clarify=on_clarify,
-                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -1616,15 +1602,6 @@ class ZoDiscordBot(commands.Bot):
             return user_response
 
         return on_clarify
-
-    def make_on_progress(self, channel):
-        """Create an on_progress callback that posts tool/subagent progress to Discord."""
-        async def on_progress(message: str):
-            try:
-                await send_suppressed(channel, content=f"⚙️ {message}")
-            except Exception:
-                pass
-        return on_progress
 
     async def typing_loop(self, channel, stop_event: asyncio.Event):
         while not stop_event.is_set():
@@ -2329,8 +2306,6 @@ class ZoDiscordBot(commands.Bot):
 
             on_thinking = self.make_on_thinking(thread)
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
-            on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
-
             async def on_conv_id(cid: str):
                 await update_conversation_id(thread_id_str, cid)
 
@@ -2341,7 +2316,6 @@ class ZoDiscordBot(commands.Bot):
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
                 on_clarify=on_clarify,
-                on_progress=on_progress,
                 model_name=channel_model,
                 persona_id=effective_persona,
                 backend=channel_backend,

@@ -342,7 +342,7 @@ All Hermes-specific logic lives in `zo_discord/hermes.py`:
 - **URL routing**: Hermes requests go to `http://127.0.0.1:8788/ask` (localhost, no auth). Zo requests go to `https://api.zo.computer/zo/ask` (Bearer token auth).
 - **Model names**: Hermes uses standard model IDs (e.g. `anthropic/claude-opus-4.6`). Zo BYOK model IDs (`byok:xxx`) are stripped by `zo-hermes`, which falls back to its configured default.
 - **Session ID changes**: When Hermes compresses context in a long conversation, it creates a new session ID linked to the old one. The End SSE event carries the new ID, and zo-discord updates the thread-to-conversation mapping automatically.
-- **SSE streaming**: `zo-hermes` emits Zo-compatible SSE events (`PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`, `SSEErrorEvent`, `ClarifyEvent`, `ProgressEvent`), so the core streaming/parsing code is shared. `ClarifyEvent` enables mid-turn clarification questions; `ProgressEvent` surfaces tool/subagent delegation progress in real time.
+- **SSE streaming**: `zo-hermes` emits Zo-compatible SSE events (`PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`, `SSEErrorEvent`, `ClarifyEvent`), so the core streaming/parsing code is shared. `ClarifyEvent` enables mid-turn clarification questions.
 - **Personas**: Hermes uses `SOUL.md` personalities, not Zo `persona_id`s. The `persona_id` field is accepted but ignored.
 
 ### Message Modes

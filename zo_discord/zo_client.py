@@ -110,7 +110,6 @@ class ZoClient:
         on_thinking: Callable[[str], Awaitable[None]] = None,
         on_conv_id: Callable[[str], Awaitable[None]] = None,
         on_clarify: Callable[[str, list, str], Awaitable[str]] = None,
-        on_progress: Callable[[str], Awaitable[None]] = None,
         model_name: str = None,
         persona_id: str = None,
         backend: str = None,
@@ -340,14 +339,6 @@ class ZoClient:
                                                     )
                                             except Exception as e:
                                                 logger.error(f"Clarify callback failed: {e}")
-
-                                    elif current_event_type == "ProgressEvent":
-                                        progress_msg = event.get("message", "")
-                                        if on_progress and progress_msg:
-                                            try:
-                                                await on_progress(progress_msg)
-                                            except Exception as e:
-                                                logger.debug(f"Progress callback failed: {e}")
 
                                     elif current_event_type == "SSEErrorEvent":
                                         error_msg = event.get("message", "")
