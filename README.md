@@ -342,6 +342,15 @@ All Hermes-specific logic lives in `zo_discord/hermes.py`:
 - **SSE streaming**: `zo-hermes` emits Zo-compatible SSE events (`PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`), so the core streaming/parsing code is shared.
 - **Personas**: Hermes uses `SOUL.md` personalities, not Zo `persona_id`s. The `persona_id` field is accepted but ignored.
 
+### Message Modes
+
+The `message_mode` channel config controls what happens when a user sends a message while the agent is still working:
+
+- **Queue** (default): Messages are collected and processed as a batch after the current turn finishes. The agent sees all queued messages at once and decides how to handle them.
+- **Interrupt**: The current Hermes session is cancelled via `POST /cancel`, and the new message is processed immediately as a fresh turn. Rapid-fire messages still batch via the debounce buffer before triggering the interrupt.
+
+Toggle with `/queue` and `/interrupt` slash commands.
+
 ### Changes to Core Modules
 
 The Hermes integration touches `bot.py` and `zo_client.py` minimally:

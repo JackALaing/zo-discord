@@ -11,6 +11,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import ui
+import aiohttp
 from aiohttp import web
 import json
 import os
@@ -604,12 +605,24 @@ class ZoDiscordBot(commands.Bot):
         if allowed_users and str(message.author.id) not in allowed_users:
             return
 
-        # For thread messages with an inflight request, bypass buffer and use existing queue
+        # For thread messages with an inflight request:
+        # - Queue mode: bypass buffer, queue immediately via handle_thread_message
+        # - Interrupt mode: let the buffer run (so rapid-fire messages batch),
+        #   then handle_thread_message will cancel the inflight turn
         if isinstance(message.channel, discord.Thread):
             thread_id = str(message.channel.id)
             if self._inflight.get(thread_id):
-                await self.handle_thread_message(message)
-                return
+                parent_channel_id = str(message.channel.parent.id) if message.channel.parent else None
+                message_mode = "queue"
+                if parent_channel_id:
+                    ch_config = await get_channel_config(parent_channel_id)
+                    if ch_config:
+                        message_mode = ch_config.get("message_mode", "queue") or "queue"
+                if message_mode == "interrupt":
+                    pass  # fall through to buffer/immediate handling below
+                else:
+                    await self.handle_thread_message(message)
+                    return
 
         # Determine buffer delay
         if isinstance(message.channel, discord.Thread) and message.channel.parent:
@@ -938,30 +951,72 @@ class ZoDiscordBot(commands.Bot):
 
         logger.info(f"Message in thread '{thread.name}' from {message.author}")
 
-        # Queue: if there's an in-flight request for this thread, queue this
-        # message and let the current turn finish. The queue is drained after
-        # each turn completes.
+        # If there's an in-flight request, behavior depends on message_mode:
+        # - queue (default): collect messages and drain after current turn
+        # - interrupt: cancel current turn, then process this message immediately
         inflight = self._inflight.get(thread_id)
         if inflight:
-            logger.info(f"In-flight request for thread {thread_id}, queuing message from {message.author}")
-            if message.attachments:
-                saved_paths = []
-                channel_name = self._get_channel_name_for_thread(thread)
-                att_dir = get_attachments_dir(channel_name)
-                for att in message.attachments:
+            parent_channel_id = str(thread.parent.id) if thread.parent else None
+            message_mode = "queue"
+            if parent_channel_id:
+                ch_config = await get_channel_config(parent_channel_id)
+                if ch_config:
+                    message_mode = ch_config.get("message_mode", "queue") or "queue"
+
+            if message_mode == "interrupt":
+                logger.info(f"Interrupt mode: cancelling inflight for thread {thread_id}")
+                session_id = inflight.get("conv_id")
+                inflight_task = inflight.get("task")
+
+                # Cancel the Hermes session
+                if session_id:
                     try:
-                        att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
-                        await att.save(att_path)
-                        saved_paths.append(str(att_path))
+                        async with aiohttp.ClientSession() as http_session:
+                            async with http_session.post(
+                                "http://127.0.0.1:8788/cancel",
+                                json={"session_id": session_id},
+                                timeout=aiohttp.ClientTimeout(total=10),
+                            ) as resp:
+                                cancel_status = resp.status
+                                logger.info(f"Cancel response for session {session_id}: {cancel_status}")
                     except Exception as e:
-                        logger.error(f"Failed to save queued attachment: {e}")
-                if saved_paths:
-                    self._presaved_attachments[message.id] = saved_paths
-            if thread_id not in self._message_queues:
-                self._message_queues[thread_id] = asyncio.Queue()
-            await self._message_queues[thread_id].put(message)
-            await send_suppressed(thread, content=f"*Queued — will process after current turn finishes.*")
-            return
+                        logger.error(f"Failed to cancel session {session_id}: {e}")
+
+                # Wait for the inflight task to finish (it should exit after cancel)
+                if inflight_task and not inflight_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(inflight_task), timeout=15)
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning(f"Inflight task didn't finish cleanly after cancel: {e}")
+
+                # Clear inflight state so this message processes as a fresh turn
+                self._inflight.pop(thread_id, None)
+                # Discard any queued messages — the interrupt supersedes them
+                self._message_queues.pop(thread_id, None)
+                await send_suppressed(thread, content=f"*Interrupting — processing your new message.*")
+                # Fall through to process this message normally
+
+            else:
+                # Queue mode (default behavior)
+                logger.info(f"Queue mode: queuing message from {message.author} in thread {thread_id}")
+                if message.attachments:
+                    saved_paths = []
+                    channel_name = self._get_channel_name_for_thread(thread)
+                    att_dir = get_attachments_dir(channel_name)
+                    for att in message.attachments:
+                        try:
+                            att_path = att_dir / f"{uuid.uuid4().hex[:8]}_{att.filename}"
+                            await att.save(att_path)
+                            saved_paths.append(str(att_path))
+                        except Exception as e:
+                            logger.error(f"Failed to save queued attachment: {e}")
+                    if saved_paths:
+                        self._presaved_attachments[message.id] = saved_paths
+                if thread_id not in self._message_queues:
+                    self._message_queues[thread_id] = asyncio.Queue()
+                await self._message_queues[thread_id].put(message)
+                await send_suppressed(thread, content=f"*Queued — will process after current turn finishes.*")
+                return
 
         # Extract per-message model and persona overrides (supports either order)
         model_override, persona_override, user_text = self.extract_overrides(message.content)
