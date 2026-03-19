@@ -28,7 +28,7 @@ from zo_discord.db import (
     update_thread_status, get_thread_status, get_mapping_by_conversation,
     set_watched, is_watched, get_all_watched_threads,
 )
-from zo_discord.zo_client import ZoClient, load_config
+from zo_discord.zo_client import ZoClient, load_config, check_hermes_health
 from zo_discord.commands import setup_commands
 from zo_discord.utils import (
     STATUS_EMOJI, set_thread_status_prefix, strip_status_prefix,
@@ -993,6 +993,14 @@ class ZoDiscordBot(commands.Bot):
                 self._inflight.pop(thread_id, None)
                 # Discard any queued messages — the interrupt supersedes them
                 self._message_queues.pop(thread_id, None)
+
+                # Wait for Hermes to be ready after cancel (up to 10s)
+                for _wait in range(5):
+                    health = await check_hermes_health()
+                    if health and health.get("status") == "ok":
+                        break
+                    await asyncio.sleep(2)
+
                 await send_suppressed(thread, content=f"*Interrupting — processing your new message.*")
                 # Fall through to process this message normally
 

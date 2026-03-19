@@ -14,9 +14,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncGenerator, Callable, Awaitable
 
-from zo_discord.hermes import get_request_config, get_backend_label, handle_session_id_change
+from zo_discord.hermes import get_request_config, get_backend_label, handle_session_id_change, is_hermes, HERMES_URL
 
 logger = logging.getLogger(__name__)
+
+HERMES_HEALTH_TIMEOUT = 2  # seconds
+
+
+async def check_hermes_health() -> dict | None:
+    """Check zo-hermes /health endpoint. Returns health dict or None if unreachable."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=HERMES_HEALTH_TIMEOUT)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{HERMES_URL}/health") as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                logger.warning(f"Hermes health check returned {resp.status}")
+                return None
+    except Exception as e:
+        logger.warning(f"Hermes health check failed: {e}")
+        return None
 
 
 @dataclass
@@ -151,6 +168,23 @@ class ZoClient:
 
         api_url, headers = get_request_config(self.api_key, backend, self.backend)
         backend_label = get_backend_label(backend, self.backend)
+
+        # Pre-flight health check for Hermes backend
+        if is_hermes(backend, self.backend):
+            health = await check_hermes_health()
+            if health is None:
+                logger.error("Hermes is unreachable — skipping /ask call")
+                return StreamResult(
+                    output="",
+                    conv_id=conversation_id or "",
+                    interrupted=False,
+                    received_events=False,
+                    error_message="zo-hermes is unreachable. The service may be down or restarting.",
+                )
+            status = health.get("status", "unknown")
+            if status != "ok":
+                active = health.get("active_sessions", "?")
+                logger.warning(f"Hermes health status: {status}, active_sessions: {active}")
 
         hermes_extras = {k: v for k, v in payload.items() if k in ("reasoning_effort", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets")}
         logger.info(f"Sending to {backend_label} API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}" + (f", hermes_params: {hermes_extras}" if hermes_extras else ""))
