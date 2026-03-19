@@ -232,6 +232,7 @@ class ZoDiscordBot(commands.Bot):
         self._message_queues = {}  # thread_id -> asyncio.Queue of discord.Message
         self._bundled_prefixes = {}  # message.id -> str, for passing context to handle_thread_message
         self._presaved_attachments = {}  # message.id -> list[str], pre-saved attachment paths
+        self._last_user_messages = {}  # thread_id -> last user message text (for /retry)
         self._thinking_mode = self.config.get("thinking_mode", "streaming")
         self._auto_archive_override = self.config.get("auto_archive_override", True)
 
@@ -1051,6 +1052,9 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": conv_id or "", "task": task}
+
+        # Cache last user message for /retry
+        self._last_user_messages[thread_id] = user_input
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))

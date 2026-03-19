@@ -24,7 +24,8 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 - **Channel instructions & memory** — Set custom instructions and memory file paths per-channel — they're injected into every conversation. Channel topic and pinned messages also provide context.
 - **Hermes channel config** — Per-channel overrides for Hermes-specific settings: `reasoning` (off/low/medium/high), `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`. Set via SQLite or the `/config` HTTP endpoint.
 - **Allowed users** — Restrict bot access to specific Discord users, or allow all users. Manage with `/allowed-users`.
-- **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`, `/reasoning`, `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, `/interrupt`
+- **Session management** — `/stop` (cancel current turn), `/undo` (remove last exchange), `/retry` (undo + re-send), `/status` (session state), `/usage` (token counts), `/compress` (compress context). Requires Hermes backend.
+- **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`, `/reasoning`, `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, `/interrupt`, `/stop`, `/undo`, `/retry`, `/status`, `/usage`, `/compress`
 
 ### Scheduled Agents
 - **Notifications** — Scheduled Zo agents can post results to new Discord threads with session continuity, so you can reply and continue the conversation. See `skill/scheduled-agent-example.md`.
@@ -197,6 +198,12 @@ All settings changed via slash commands are persisted to `config.json` and survi
 | `/queue` | Set message mode to queue (batch messages) |
 | `/interrupt` | Set message mode to interrupt (cancel current turn) |
 | `/backend` | View/change backend (Zo/Hermes) |
+| `/stop` | Cancel the current agent turn (Hermes) |
+| `/undo` | Undo the last user+assistant exchange (Hermes) |
+| `/retry` | Undo and re-send the last user message (Hermes) |
+| `/status` | Show session state — running/idle, iterations, tokens (Hermes) |
+| `/usage` | Show token usage — input/output/cache, cost, context % (Hermes) |
+| `/compress` | Compress session context to free up context window (Hermes) |
 
 ## Per-Thread Model Override
 

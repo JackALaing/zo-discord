@@ -3,18 +3,56 @@ Slash commands for zo-discord.
 """
 
 import json
+import logging
 import os
 from pathlib import Path
 
+import aiohttp
 import discord
 import yaml
 from discord import ui
 from zo_discord import PROJECT_ROOT
-from zo_discord.db import get_channel_config, set_channel_config, get_conversation_id
+from zo_discord.db import get_channel_config, set_channel_config, get_conversation_id, update_conversation_id
 from zo_discord.hermes import is_hermes
 from zo_discord.zo_client import load_config
 
+logger = logging.getLogger("zo_discord.commands")
+
+HERMES_BASE = "http://127.0.0.1:8788"
+
 HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
+
+
+async def _hermes_post(path: str, payload: dict) -> tuple[int, dict]:
+    """POST to a zo-hermes endpoint. Returns (status_code, json_body)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{HERMES_BASE}{path}",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await resp.json()
+                return resp.status, body
+    except Exception as e:
+        logger.error("Hermes POST %s failed: %s", path, e)
+        return 0, {"error": f"zo-hermes unreachable: {e}"}
+
+
+async def _hermes_get(path: str, params: dict | None = None) -> tuple[int, dict]:
+    """GET from a zo-hermes endpoint. Returns (status_code, json_body)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{HERMES_BASE}{path}",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                body = await resp.json()
+                return resp.status, body
+    except Exception as e:
+        logger.error("Hermes GET %s failed: %s", path, e)
+        return 0, {"error": f"zo-hermes unreachable: {e}"}
 
 AVAILABLE_TOOLSETS = [
     "web", "terminal", "file", "browser", "vision", "image_gen",
@@ -523,6 +561,14 @@ def setup_commands(bot):
         help_ch_config = await get_channel_config(str(help_channel.id))
         msg_mode = help_ch_config.get("message_mode", "queue") if help_ch_config else "queue"
         lines.append(f"`/queue` / `/interrupt` — message mode (currently: {msg_mode})")
+        lines.append("")
+        lines.append("**Session Management**")
+        lines.append("`/stop` — Cancel the current agent turn")
+        lines.append("`/undo` — Undo the last exchange")
+        lines.append("`/retry` — Undo and re-send the last message")
+        lines.append("`/status` — Show session state")
+        lines.append("`/usage` — Show token usage")
+        lines.append("`/compress` — Compress session context")
 
         await ctx.respond("\n".join(lines), ephemeral=True)
 
@@ -944,3 +990,210 @@ def setup_commands(bot):
             "⚡ **Interrupt mode** — messages will cancel the current turn and be injected immediately. Use `/queue` to switch.",
             ephemeral=True,
         )
+
+    # --- Session management commands (call zo-hermes endpoints) ---
+
+    async def _get_session_id(ctx: discord.ApplicationContext) -> str | None:
+        """Get the hermes session_id for the current thread."""
+        if not isinstance(ctx.channel, discord.Thread):
+            return None
+        return await get_conversation_id(str(ctx.channel.id))
+
+    @bot.slash_command(name="stop", description="Cancel the current agent turn")
+    async def stop_cmd(ctx: discord.ApplicationContext):
+        session_id = await _get_session_id(ctx)
+        if not session_id:
+            await ctx.respond("Nothing running.", ephemeral=True)
+            return
+
+        status_code, body = await _hermes_post("/cancel", {"session_id": session_id})
+        if status_code == 200:
+            await ctx.respond("⏹️ Cancelled.", ephemeral=True)
+        elif status_code == 404:
+            await ctx.respond("Nothing running.", ephemeral=True)
+        else:
+            await ctx.respond(f"Error: {body.get('error', 'Unknown error')}", ephemeral=True)
+
+    @bot.slash_command(name="undo", description="Undo the last exchange")
+    async def undo_cmd(ctx: discord.ApplicationContext):
+        session_id = await _get_session_id(ctx)
+        if not session_id:
+            await ctx.respond("No session active in this thread.", ephemeral=True)
+            return
+
+        status_code, body = await _hermes_post("/undo", {"session_id": session_id})
+        if status_code != 200:
+            await ctx.respond(f"Error: {body.get('error', 'Unknown error')}", ephemeral=True)
+            return
+
+        # Try to react to recent bot messages in this thread
+        removed_count = body.get("removed_count", 0)
+        if isinstance(ctx.channel, discord.Thread) and removed_count > 0:
+            try:
+                reacted = 0
+                async for msg in ctx.channel.history(limit=50):
+                    if msg.author == bot.user and reacted < removed_count:
+                        await msg.add_reaction("🚫")
+                        reacted += 1
+                    elif msg.author != bot.user and reacted > 0:
+                        await msg.add_reaction("🚫")
+                        break
+            except Exception as e:
+                logger.warning("Failed to add undo reactions: %s", e)
+
+        await ctx.respond(
+            f"↩️ Last exchange undone. ({body.get('removed_count', 0)} messages removed)",
+            ephemeral=True,
+        )
+
+    @bot.slash_command(name="retry", description="Undo and re-send the last message")
+    async def retry_cmd(ctx: discord.ApplicationContext):
+        session_id = await _get_session_id(ctx)
+        if not session_id:
+            await ctx.respond("No session active in this thread.", ephemeral=True)
+            return
+
+        thread_id = str(ctx.channel.id) if isinstance(ctx.channel, discord.Thread) else None
+        last_msg = bot._last_user_messages.get(thread_id) if thread_id else None
+        if not last_msg:
+            await ctx.respond("No cached user message to retry.", ephemeral=True)
+            return
+
+        # Undo first
+        status_code, body = await _hermes_post("/undo", {"session_id": session_id})
+        if status_code != 200:
+            await ctx.respond(f"Undo failed: {body.get('error', 'Unknown error')}", ephemeral=True)
+            return
+
+        await ctx.respond("🔄 Retrying last message...", ephemeral=True)
+
+        # Re-send via Hermes /ask endpoint
+        try:
+            status_code, body = await _hermes_post("/ask", {
+                "input": last_msg,
+                "conversation_id": session_id,
+            })
+            if status_code == 200 and body.get("output"):
+                # Send response in chunks if needed (Discord 2000 char limit)
+                text = body["output"]
+                while text:
+                    chunk = text[:2000]
+                    text = text[2000:]
+                    await ctx.channel.send(chunk)
+            elif body.get("error"):
+                await ctx.channel.send(f"Retry failed: {body['error']}")
+        except Exception as e:
+            logger.error("Retry failed: %s", e)
+            await ctx.channel.send(f"Retry failed: {e}")
+
+    @bot.slash_command(name="status", description="Show session status")
+    async def status_cmd(ctx: discord.ApplicationContext):
+        session_id = await _get_session_id(ctx)
+        if not session_id:
+            await ctx.respond("No session active in this thread.", ephemeral=True)
+            return
+
+        status_code, body = await _hermes_get("/status", {"session_id": session_id})
+        if status_code != 200:
+            await ctx.respond(f"Error: {body.get('error', 'Unknown error')}", ephemeral=True)
+            return
+
+        state = body.get("state", "unknown")
+        state_emoji = "🟢" if state == "running" else "⚪"
+        lines = [f"{state_emoji} **State:** {state}"]
+
+        if body.get("model"):
+            lines.append(f"**Model:** `{body['model']}`")
+        if body.get("iterations_used") is not None:
+            lines.append(f"**Iterations:** {body['iterations_used']}/{body.get('iterations_max', '?')}")
+        if body.get("input_tokens"):
+            lines.append(f"**Tokens:** {body['input_tokens']:,} in / {body.get('output_tokens', 0):,} out")
+        if body.get("api_calls"):
+            lines.append(f"**API calls:** {body['api_calls']}")
+        if body.get("message_count"):
+            lines.append(f"**Messages:** {body['message_count']}")
+
+        await ctx.respond("\n".join(lines), ephemeral=True)
+
+    @bot.slash_command(name="usage", description="Show token usage for this session")
+    async def usage_cmd(ctx: discord.ApplicationContext):
+        session_id = await _get_session_id(ctx)
+        if not session_id:
+            await ctx.respond("No session active in this thread.", ephemeral=True)
+            return
+
+        status_code, body = await _hermes_get("/usage", {"session_id": session_id})
+        if status_code != 200:
+            await ctx.respond(f"Error: {body.get('error', 'Unknown error')}", ephemeral=True)
+            return
+
+        lines = ["**Session Usage**"]
+
+        if body.get("model"):
+            lines.append(f"Model: `{body['model']}`")
+
+        if body.get("input_tokens") is not None:
+            lines.append(f"Input: {body['input_tokens']:,} tokens")
+            lines.append(f"Output: {body.get('output_tokens', 0):,} tokens")
+            if body.get("cache_read_tokens"):
+                lines.append(f"Cache read: {body['cache_read_tokens']:,}")
+            if body.get("cache_write_tokens"):
+                lines.append(f"Cache write: {body['cache_write_tokens']:,}")
+
+        if body.get("total_tokens"):
+            lines.append(f"Total: {body['total_tokens']:,} tokens")
+        if body.get("api_calls"):
+            lines.append(f"API calls: {body['api_calls']}")
+
+        if body.get("context_used_pct") is not None:
+            pct = body["context_used_pct"]
+            bar_filled = round(pct / 10)
+            bar = "█" * bar_filled + "░" * (10 - bar_filled)
+            lines.append(f"Context: {bar} {pct}%")
+
+        if body.get("cost_usd") is not None:
+            lines.append(f"Cost: ${body['cost_usd']:.4f}")
+
+        if body.get("compression_count"):
+            lines.append(f"Compressions: {body['compression_count']}")
+
+        if body.get("note"):
+            lines.append(f"*{body['note']}*")
+
+        await ctx.respond("\n".join(lines), ephemeral=True)
+
+    @bot.slash_command(name="compress", description="Compress session context")
+    async def compress_cmd(ctx: discord.ApplicationContext):
+        session_id = await _get_session_id(ctx)
+        if not session_id:
+            await ctx.respond("No session active in this thread.", ephemeral=True)
+            return
+
+        await ctx.defer(ephemeral=True)
+
+        status_code, body = await _hermes_post("/compress", {"session_id": session_id})
+        if status_code != 200:
+            await ctx.followup.send(f"Error: {body.get('error', 'Unknown error')}", ephemeral=True)
+            return
+
+        lines = ["🗜️ Context compressed."]
+        before = body.get("before", {})
+        after = body.get("after", {})
+        if before and after:
+            lines.append(
+                f"Messages: {before.get('messages', '?')} → {after.get('messages', '?')}"
+            )
+            if before.get("tokens") and after.get("tokens"):
+                saved = before["tokens"] - after["tokens"]
+                lines.append(
+                    f"Tokens: {before['tokens']:,} → {after['tokens']:,} (saved {saved:,})"
+                )
+
+        if body.get("previous_session_id"):
+            new_sid = body.get("session_id")
+            lines.append(f"Session ID changed: `{new_sid}`")
+            # Update the DB with new session ID
+            if isinstance(ctx.channel, discord.Thread):
+                await update_conversation_id(str(ctx.channel.id), new_sid)
+
+        await ctx.followup.send("\n".join(lines), ephemeral=True)
