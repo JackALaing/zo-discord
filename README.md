@@ -146,20 +146,20 @@ cp -r skill/ /home/workspace/Skills/zo-discord/
 3. Bot creates a thread with Zo's response
 4. Thread-to-conversation mapping is stored in SQLite
 5. Follow-up messages in the thread continue the same Zo session
-6. Scheduled Zo agents can use the CLI to spawn new Discord threads linked to their active session
+6. Scheduled Zo agents can use the CLI (with `--conv-id` or env vars) to spawn new Discord threads linked to their active session
 
 ## CLI Reference
 
-The `zo-discord` CLI auto-detects the conversation ID from the workspace path. No thread ID needed.
+The `zo-discord` CLI detects the conversation ID via: (1) `--conv-id` flag (injected into Zo's context by the bot), or (2) `CONVERSATION_ID` / `ZO_CONVERSATION_ID` env vars (set by Hermes agents). No manual thread ID needed.
 
 ```
-zo-discord rename "Title"                              — Rename the thread
-zo-discord error                                       — Set thread status to error
+zo-discord --conv-id <id> rename "Title"               — Rename the thread
+zo-discord --conv-id <id> error                        — Set thread status to error
 zo-discord notify "Title" "content" --channel-name general  — Post to a new thread
 zo-discord notify "Title" --file /tmp/out.md --channel-name pulse  — Post file contents
-zo-discord buttons "Prompt?" "Yes:success" "No:danger" — Send interactive buttons
-zo-discord buttons "Prompt?" --preset yes_no           — Use a button preset
-zo-discord new-thread "Title" "prompt"                 — Spawn a new thread
+zo-discord --conv-id <id> buttons "Prompt?" "Yes:success" "No:danger" — Send interactive buttons
+zo-discord --conv-id <id> buttons "Prompt?" --preset yes_no           — Use a button preset
+zo-discord --conv-id <id> new-thread "Title" "prompt"  — Spawn a new thread
 ```
 
 See `skill/SKILL.md` for full HTTP API documentation.
