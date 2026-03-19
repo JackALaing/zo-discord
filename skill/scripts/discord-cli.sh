@@ -19,6 +19,18 @@
 set -euo pipefail
 
 API="http://localhost:8787"
+
+# Parse --conv-id from anywhere in args before extracting the command
+CONV_ID=""
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --conv-id) CONV_ID="$2"; shift 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
 CMD="${1:?Usage: zo-discord <command> [args...] (try 'zo-discord help')}"
 shift
 
@@ -44,19 +56,6 @@ Conv ID: pass --conv-id <id>, or set CONVERSATION_ID / ZO_CONVERSATION_ID env va
 HELP
   exit 0
 fi
-
-# Auto-detect conversation ID
-CONV_ID=""
-
-# 1. Check for --conv-id flag (can appear anywhere in remaining args)
-ARGS=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --conv-id) CONV_ID="$2"; shift 2 ;;
-    *) ARGS+=("$1"); shift ;;
-  esac
-done
-set -- "${ARGS[@]+"${ARGS[@]}"}"
 
 # 2. CONVERSATION_ID env var (Hermes agents get this from zo-hermes/server.py)
 if [[ -z "$CONV_ID" && -n "${CONVERSATION_ID:-}" ]]; then
