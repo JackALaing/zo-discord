@@ -1067,24 +1067,9 @@ def setup_commands(bot):
 
         await ctx.respond("🔄 Retrying last message...", ephemeral=True)
 
-        # Re-send via Hermes /ask endpoint
-        try:
-            status_code, body = await _hermes_post("/ask", {
-                "input": last_msg,
-                "conversation_id": session_id,
-            })
-            if status_code == 200 and body.get("output"):
-                # Send response in chunks if needed (Discord 2000 char limit)
-                text = body["output"]
-                while text:
-                    chunk = text[:2000]
-                    text = text[2000:]
-                    await ctx.channel.send(chunk)
-            elif body.get("error"):
-                await ctx.channel.send(f"Retry failed: {body['error']}")
-        except Exception as e:
-            logger.error("Retry failed: %s", e)
-            await ctx.channel.send(f"Retry failed: {e}")
+        # Re-send through the bot's normal streaming pipeline
+        import asyncio
+        asyncio.create_task(bot.retry_in_thread(ctx.channel))
 
     @bot.slash_command(name="status", description="Show session status")
     async def status_cmd(ctx: discord.ApplicationContext):

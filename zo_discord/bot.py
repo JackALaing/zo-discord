@@ -1180,6 +1180,86 @@ class ZoDiscordBot(commands.Bot):
 
             await self._drain_queue(thread_id)
 
+    async def retry_in_thread(self, thread: discord.Thread):
+        """Re-send the last cached user message through the normal streaming pipeline."""
+        thread_id = str(thread.id)
+        user_input = self._last_user_messages.get(thread_id)
+        if not user_input:
+            return
+
+        conv_id = await get_conversation_id(thread_id)
+        if not conv_id:
+            return
+
+        parent_channel_id = str(thread.parent.id) if thread.parent else None
+        channel_backend = None
+        channel_hermes_params = {}
+        effective_model = None
+        effective_persona = None
+        if parent_channel_id:
+            effective_model, effective_persona, channel_backend, channel_hermes_params = await self.resolve_channel_defaults(parent_channel_id)
+        if not effective_persona:
+            config = load_config()
+            effective_persona = config.get("default_persona")
+
+        on_thinking = self.make_on_thinking(thread)
+
+        async def on_conv_id(cid: str):
+            if cid != conv_id:
+                await update_conversation_id(thread_id, cid)
+            if thread_id in self._inflight:
+                self._inflight[thread_id]["conv_id"] = cid
+
+        task = asyncio.current_task()
+        self._inflight[thread_id] = {"conv_id": conv_id, "task": task}
+
+        stop_event = asyncio.Event()
+        typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
+        try:
+            result = await self.zo.ask_stream(
+                user_input,
+                conversation_id=conv_id,
+                context=None,
+                file_paths=None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                model_name=effective_model,
+                persona_id=effective_persona,
+                backend=channel_backend,
+                **channel_hermes_params,
+            )
+            response = result.output
+
+            if result.conv_id and result.conv_id != conv_id:
+                await update_conversation_id(thread_id, result.conv_id)
+
+            await update_activity(thread_id)
+
+            if not response or not response.strip():
+                if result.error_message:
+                    response = f"\u26a0\ufe0f **Retry failed.**\n\n`{result.error_message[:200]}`"
+
+            if response and response.strip():
+                chunks = self.zo.chunk_response(response)
+                for chunk in chunks:
+                    if chunk.strip():
+                        await send_suppressed(thread, content=chunk)
+        except asyncio.CancelledError:
+            logger.info(f"Retry cancelled for thread {thread_id}")
+        except Exception as e:
+            logger.error(f"Retry error in thread {thread_id}: {e}", exc_info=True)
+            try:
+                await send_suppressed(thread, content=f"\u274c **Retry failed:** {e}")
+            except Exception:
+                pass
+        finally:
+            self._inflight.pop(thread_id, None)
+            stop_event.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
+
     def _collect_queued_text(self, thread_id: str) -> list[str]:
         """Consume all queued messages for a thread, returning their text.
 
