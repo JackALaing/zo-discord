@@ -109,6 +109,8 @@ class ZoClient:
         file_paths: list[str] = None,
         on_thinking: Callable[[str], Awaitable[None]] = None,
         on_conv_id: Callable[[str], Awaitable[None]] = None,
+        on_clarify: Callable[[str, list, str], Awaitable[str]] = None,
+        on_progress: Callable[[str], Awaitable[None]] = None,
         model_name: str = None,
         persona_id: str = None,
         backend: str = None,
@@ -316,6 +318,36 @@ class ZoClient:
                                             thinking_buffer = ""
                                         in_thinking_part = False
                                         in_text_part = False
+
+                                    elif current_event_type == "ClarifyEvent":
+                                        if on_clarify:
+                                            clarify_question = event.get("question", "")
+                                            clarify_choices = event.get("choices")
+                                            clarify_session = event.get("session_id", conv_id)
+                                            try:
+                                                user_answer = await on_clarify(
+                                                    clarify_question, clarify_choices, clarify_session,
+                                                )
+                                                # Send response back to zo-hermes
+                                                async with aiohttp.ClientSession() as clarify_http:
+                                                    await clarify_http.post(
+                                                        "http://127.0.0.1:8788/clarify-response",
+                                                        json={
+                                                            "session_id": clarify_session,
+                                                            "response": user_answer,
+                                                        },
+                                                        timeout=aiohttp.ClientTimeout(total=10),
+                                                    )
+                                            except Exception as e:
+                                                logger.error(f"Clarify callback failed: {e}")
+
+                                    elif current_event_type == "ProgressEvent":
+                                        progress_msg = event.get("message", "")
+                                        if on_progress and progress_msg:
+                                            try:
+                                                await on_progress(progress_msg)
+                                            except Exception as e:
+                                                logger.debug(f"Progress callback failed: {e}")
 
                                     elif current_event_type == "SSEErrorEvent":
                                         error_msg = event.get("message", "")

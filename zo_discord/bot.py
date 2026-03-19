@@ -168,6 +168,8 @@ class ButtonCallbackView(ui.View):
                         btn_hermes_params = {}
                         if thread.parent:
                             _, _, btn_backend, btn_hermes_params = await self.bot.resolve_channel_defaults(str(thread.parent.id))
+                        on_clarify = self.bot.make_on_clarify(thread) if btn_backend == "hermes" else None
+                        on_progress = self.bot.make_on_progress(thread) if btn_backend == "hermes" else None
                         context, file_paths = await self.bot.build_thread_context(thread, include_source=False, conv_id=conv_id, backend=btn_backend or "")
                         result = await self.bot.zo.ask_stream(
                             choice_msg,
@@ -176,6 +178,8 @@ class ButtonCallbackView(ui.View):
                             file_paths=file_paths or None,
                             on_thinking=on_thinking,
                             on_conv_id=on_conv_id,
+                            on_clarify=on_clarify,
+                            on_progress=on_progress,
                             **btn_hermes_params,
                         )
                         response, new_conv_id = result.output, result.conv_id
@@ -234,6 +238,7 @@ class ZoDiscordBot(commands.Bot):
         self._bundled_prefixes = {}  # message.id -> str, for passing context to handle_thread_message
         self._presaved_attachments = {}  # message.id -> list[str], pre-saved attachment paths
         self._last_user_messages = {}  # thread_id -> last user message text (for /retry)
+        self._pending_clarify = {}  # thread_id -> asyncio.Future for clarify response
         self._thinking_mode = self.config.get("thinking_mode", "streaming")
         self._auto_archive_override = self.config.get("auto_archive_override", True)
 
@@ -739,12 +744,17 @@ class ZoDiscordBot(commands.Bot):
             if attachment_paths:
                 file_paths.extend(attachment_paths)
 
+            on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+            on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
+
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -877,12 +887,17 @@ class ZoDiscordBot(commands.Bot):
             context, file_paths = await self.build_channel_context(channel, backend=channel_backend)
             file_paths.extend(all_attachment_paths)
 
+            on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+            on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
+
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -950,6 +965,13 @@ class ZoDiscordBot(commands.Bot):
             return
 
         logger.info(f"Message in thread '{thread.name}' from {message.author}")
+
+        # If there's a pending clarify question, resolve it with this message
+        clarify_future = self._pending_clarify.get(thread_id)
+        if clarify_future and not clarify_future.done():
+            logger.info(f"Resolving pending clarify for thread {thread_id}: {message.content[:100]}")
+            clarify_future.set_result(message.content)
+            return
 
         # If there's an in-flight request, behavior depends on message_mode:
         # - queue (default): collect messages and drain after current turn
@@ -1106,6 +1128,8 @@ class ZoDiscordBot(commands.Bot):
             user_input = f"{bundled_prefix}\n[{message.author.display_name}]: {user_input}"
 
         on_thinking = self.make_on_thinking(thread)
+        on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+        on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
 
         async def on_conv_id(cid: str):
             if cid != conv_id:
@@ -1129,6 +1153,8 @@ class ZoDiscordBot(commands.Bot):
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -1266,6 +1292,8 @@ class ZoDiscordBot(commands.Bot):
             effective_persona = config.get("default_persona")
 
         on_thinking = self.make_on_thinking(thread)
+        on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+        on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
 
         async def on_conv_id(cid: str):
             if cid != conv_id:
@@ -1286,6 +1314,8 @@ class ZoDiscordBot(commands.Bot):
                 file_paths=None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                on_progress=on_progress,
                 model_name=effective_model,
                 persona_id=effective_persona,
                 backend=channel_backend,
@@ -1546,6 +1576,56 @@ class ZoDiscordBot(commands.Bot):
             if self._thinking_mode == "streaming":
                 await send_suppressed(channel, content=f"*{text}*")
         return on_thinking
+
+    def make_on_clarify(self, thread):
+        """Create an on_clarify callback that posts a question to Discord and waits for the user's reply."""
+        thread_id = str(thread.id)
+
+        async def on_clarify(question: str, choices: list, session_id: str) -> str:
+            # Format the clarify message
+            msg_parts = [f"❓ **Clarification needed:**\n\n{question}"]
+            if choices:
+                for i, choice in enumerate(choices, 1):
+                    msg_parts.append(f"  {i}. {choice}")
+                msg_parts.append(f"  {len(choices) + 1}. Other (type your answer)")
+                msg_parts.append("\n*Reply with a number or type your answer:*")
+            else:
+                msg_parts.append("\n*Type your response:*")
+
+            await send_suppressed(thread, content="\n".join(msg_parts))
+
+            # Wait for the user's reply via a Future
+            future = asyncio.get_event_loop().create_future()
+            self._pending_clarify[thread_id] = future
+            try:
+                user_response = await asyncio.wait_for(future, timeout=120)
+            except asyncio.TimeoutError:
+                await send_suppressed(thread, content="*Clarify timed out — agent will decide.*")
+                return (
+                    "The user did not provide a response within the time limit. "
+                    "Use your best judgement to make the choice and proceed."
+                )
+            finally:
+                self._pending_clarify.pop(thread_id, None)
+
+            # If choices were offered and user replied with a number, resolve it
+            if choices and user_response.strip().isdigit():
+                idx = int(user_response.strip()) - 1
+                if 0 <= idx < len(choices):
+                    return choices[idx]
+                # If they picked the "Other" number, it's the same as freeform
+            return user_response
+
+        return on_clarify
+
+    def make_on_progress(self, channel):
+        """Create an on_progress callback that posts tool/subagent progress to Discord."""
+        async def on_progress(message: str):
+            try:
+                await send_suppressed(channel, content=f"⚙️ {message}")
+            except Exception:
+                pass
+        return on_progress
 
     async def typing_loop(self, channel, stop_event: asyncio.Event):
         while not stop_event.is_set():
@@ -2249,6 +2329,8 @@ class ZoDiscordBot(commands.Bot):
             thread_id_str = str(thread.id)
 
             on_thinking = self.make_on_thinking(thread)
+            on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+            on_progress = self.make_on_progress(thread) if channel_backend == "hermes" else None
 
             async def on_conv_id(cid: str):
                 await update_conversation_id(thread_id_str, cid)
@@ -2259,6 +2341,8 @@ class ZoDiscordBot(commands.Bot):
                 file_paths=file_paths or None,
                 on_thinking=on_thinking,
                 on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                on_progress=on_progress,
                 model_name=channel_model,
                 persona_id=effective_persona,
                 backend=channel_backend,

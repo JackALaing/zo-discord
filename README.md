@@ -16,6 +16,7 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 - **Message queuing** — Send multiple messages while Zo is thinking. They're batched and delivered when the current turn finishes.
 - **Reply context** — Reply to a specific message in a thread and Zo sees which message you're responding to.
 - **File attachments** — Attach files to your messages and Zo will receive them.
+- **Agent clarifications** — When Hermes needs clarification, the question is posted to the thread (with numbered choices if applicable). Your reply resolves the question and the agent continues seamlessly. 120s timeout.
 - **Discord formatting** — Markdown is automatically reformatted for Discord: tables become bullet outlines or code blocks, footnotes become inline links, link embeds are suppressed, and task lists are converted to plain lists.
 
 ### Configuration
@@ -341,7 +342,7 @@ All Hermes-specific logic lives in `zo_discord/hermes.py`:
 - **URL routing**: Hermes requests go to `http://127.0.0.1:8788/ask` (localhost, no auth). Zo requests go to `https://api.zo.computer/zo/ask` (Bearer token auth).
 - **Model names**: Hermes uses standard model IDs (e.g. `anthropic/claude-opus-4.6`). Zo BYOK model IDs (`byok:xxx`) are stripped by `zo-hermes`, which falls back to its configured default.
 - **Session ID changes**: When Hermes compresses context in a long conversation, it creates a new session ID linked to the old one. The End SSE event carries the new ID, and zo-discord updates the thread-to-conversation mapping automatically.
-- **SSE streaming**: `zo-hermes` emits Zo-compatible SSE events (`PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`), so the core streaming/parsing code is shared.
+- **SSE streaming**: `zo-hermes` emits Zo-compatible SSE events (`PartStartEvent`, `PartDeltaEvent`, `PartEndEvent`, `End`, `SSEErrorEvent`, `ClarifyEvent`, `ProgressEvent`), so the core streaming/parsing code is shared. `ClarifyEvent` enables mid-turn clarification questions; `ProgressEvent` surfaces tool/subagent delegation progress in real time.
 - **Personas**: Hermes uses `SOUL.md` personalities, not Zo `persona_id`s. The `persona_id` field is accepted but ignored.
 
 ### Message Modes
