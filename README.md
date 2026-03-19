@@ -205,7 +205,7 @@ All settings changed via slash commands are persisted to `config.json` and survi
 | `/usage` | Show token usage — input/output/cache, cost, context % (Hermes only) |
 | `/compress` | Compress session context to free up context window (Hermes only) |
 
-Commands marked "(Hermes only)" will respond with "This command is only available in Hermes channels" when used in a Zo channel. This also applies to `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, and `/interrupt`.
+Commands marked "(Hermes only)" will respond with "This command is only available in Hermes channels" when used in a Zo channel. This also applies to `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, and `/interrupt`. The `/help` command is context-aware — Hermes-only sections are hidden when used in a Zo channel.
 
 ## Per-Thread Model Override
 
