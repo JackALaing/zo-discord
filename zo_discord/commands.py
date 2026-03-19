@@ -120,7 +120,7 @@ TIPS = [
     "zo-discord supports **message buffering** (`/buffer`). Set a delay (e.g. 2s) so rapid-fire messages are combined into a single request. The timer pauses while you're typing, so you won't feel rushed. Great for composing multi-part prompts.",
     "Use zo-discord as a **notification channel** for scheduled tasks instead of SMS/email/Telegram. See the zo-discord skill for more details.",
     "zo-discord can override Discord's **auto-archive** behavior to keep threads open until you manually archive them. React with :white_check_mark: to any message in the thread to archive it. Set this as your double-tap reaction on mobile for quick archiving.",
-    "You can set **model and persona per-channel** using the `/model` and `/persona` commands. Models and personas use IDs that are hard to remember, so you can ask Zo to set aliases, then use the alias. You can also prefix your prompt with `/model-alias` (e.g. `/opus`) and `@persona-alias` (e.g. `@pirate`) to override the channel default. For example, you could set Sonnet as your default model for the channel, but prefix a prompt with `/opus` to use Opus for just that conversation.",
+    "Set **model and persona per-channel** with `/model` and `/persona`. Ask Zo to set aliases, then prefix prompts with `/alias` (e.g. `/opus`) or `@alias` (e.g. `@pirate`) to override the channel default for one conversation.",
     "zo-discord automatically recognizes **new channels**. Just create a channel and send a message to initialize it. Scheduled agents can target channels by name. See the zo-discord skill for more details.",
     "zo-discord supports **per-channel instructions and memory paths**, but has no built-in memory system. Plug in your own memory system to maintain these file paths.",
     "**Reply to specific messages** in a thread — Zo will see which message you're responding to and include it as context.",
@@ -511,6 +511,15 @@ class BackendSelectView(ui.View):
         )
 
 
+async def _require_hermes(ctx: discord.ApplicationContext) -> bool:
+    """Check if channel is Hermes. If not, respond with error and return False."""
+    backend = await _get_channel_backend(ctx)
+    if not _is_hermes_ctx(backend):
+        await ctx.respond("This command is only available in Hermes channels.", ephemeral=True)
+        return False
+    return True
+
+
 def setup_commands(bot):
     """Register all slash commands on the bot."""
 
@@ -875,6 +884,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="tools", description="View enabled/disabled toolsets for this channel")
     async def tools_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         channel_id = str(channel.id)
         ch_config = await get_channel_config(channel_id)
@@ -904,6 +915,8 @@ def setup_commands(bot):
         ctx: discord.ApplicationContext,
         value: discord.Option(int, description="Max iterations (blank to view current)", required=False) = None,
     ):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         channel_id = str(channel.id)
         ch_config = await get_channel_config(channel_id)
@@ -926,6 +939,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="skip-memory", description="Toggle memory skip for this channel")
     async def skip_memory_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         channel_id = str(channel.id)
         ch_config = await get_channel_config(channel_id)
@@ -938,6 +953,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="skip-context", description="Toggle context skip for this channel")
     async def skip_context_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         channel_id = str(channel.id)
         ch_config = await get_channel_config(channel_id)
@@ -955,6 +972,8 @@ def setup_commands(bot):
         ctx: discord.ApplicationContext,
         value: discord.Option(float, description="Threshold (0.0-1.0, blank to view)", required=False) = None,
     ):
+        if not await _require_hermes(ctx):
+            return
         hermes_cfg = _read_hermes_config()
         current = hermes_cfg.get("compression", {}).get("threshold")
 
@@ -975,6 +994,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="queue", description="Set message mode to queue (batch messages)")
     async def queue_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         await set_channel_config(str(channel.id), message_mode="queue")
         await ctx.respond(
@@ -984,6 +1005,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="interrupt", description="Set message mode to interrupt (cancel current turn)")
     async def interrupt_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         await set_channel_config(str(channel.id), message_mode="interrupt")
         await ctx.respond(
@@ -1001,6 +1024,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="stop", description="Cancel the current agent turn")
     async def stop_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         session_id = await _get_session_id(ctx)
         if not session_id:
             await ctx.respond("Nothing running.", ephemeral=True)
@@ -1016,6 +1041,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="undo", description="Undo the last exchange")
     async def undo_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         session_id = await _get_session_id(ctx)
         if not session_id:
             await ctx.respond("No session active in this thread.", ephemeral=True)
@@ -1048,6 +1075,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="retry", description="Undo and re-send the last message")
     async def retry_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         session_id = await _get_session_id(ctx)
         if not session_id:
             await ctx.respond("No session active in this thread.", ephemeral=True)
@@ -1073,6 +1102,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="status", description="Show session status")
     async def status_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         session_id = await _get_session_id(ctx)
         if not session_id:
             await ctx.respond("No session active in this thread.", ephemeral=True)
@@ -1102,6 +1133,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="usage", description="Show token usage for this session")
     async def usage_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         session_id = await _get_session_id(ctx)
         if not session_id:
             await ctx.respond("No session active in this thread.", ephemeral=True)
@@ -1149,6 +1182,8 @@ def setup_commands(bot):
 
     @bot.slash_command(name="compress", description="Compress session context")
     async def compress_cmd(ctx: discord.ApplicationContext):
+        if not await _require_hermes(ctx):
+            return
         session_id = await _get_session_id(ctx)
         if not session_id:
             await ctx.respond("No session active in this thread.", ephemeral=True)

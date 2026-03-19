@@ -198,12 +198,14 @@ All settings changed via slash commands are persisted to `config.json` and survi
 | `/queue` | Set message mode to queue (batch messages) |
 | `/interrupt` | Set message mode to interrupt (cancel current turn) |
 | `/backend` | View/change backend (Zo/Hermes) |
-| `/stop` | Cancel the current agent turn (Hermes) |
-| `/undo` | Undo the last user+assistant exchange (Hermes) |
-| `/retry` | Undo and re-send the last user message (Hermes) |
-| `/status` | Show session state — running/idle, iterations, tokens (Hermes) |
-| `/usage` | Show token usage — input/output/cache, cost, context % (Hermes) |
-| `/compress` | Compress session context to free up context window (Hermes) |
+| `/stop` | Cancel the current agent turn (Hermes only) |
+| `/undo` | Undo the last user+assistant exchange (Hermes only) |
+| `/retry` | Undo and re-send the last user message (Hermes only) |
+| `/status` | Show session state — running/idle, iterations, tokens (Hermes only) |
+| `/usage` | Show token usage — input/output/cache, cost, context % (Hermes only) |
+| `/compress` | Compress session context to free up context window (Hermes only) |
+
+Commands marked "(Hermes only)" will respond with "This command is only available in Hermes channels" when used in a Zo channel. This also applies to `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, and `/interrupt`.
 
 ## Per-Thread Model Override
 
