@@ -1,6 +1,6 @@
 #!/bin/bash
 # zo-discord CLI — control Discord threads from Zo conversations
-# Auto-detects conversation ID from workspace path.
+# Conversation ID: --conv-id flag (Zo agents) or CONVERSATION_ID env var (Hermes agents).
 #
 # Usage: zo-discord <command> [args...]
 #
@@ -40,7 +40,7 @@ Commands:
   new-thread <title> <prompt> [--channel-name NAME]  Spawn a new thread
 
 Channel targeting: use --channel-name <name> or --channel <id>
-Conv ID: auto-detected from workspace path, CONVERSATION_ID (or ZO_CONVERSATION_ID), or --conv-id <id>
+Conv ID: pass --conv-id <id>, or set CONVERSATION_ID / ZO_CONVERSATION_ID env var
 HELP
   exit 0
 fi
@@ -58,22 +58,18 @@ while [[ $# -gt 0 ]]; do
 done
 set -- "${ARGS[@]+"${ARGS[@]}"}"
 
-# 2. Try workspace path
-if [[ -z "$CONV_ID" && "$PWD" =~ /home/\.z/workspaces/(con_[^/]+) ]]; then
-  CONV_ID="${BASH_REMATCH[1]}"
-fi
-
-# 3. Try CONVERSATION_ID or ZO_CONVERSATION_ID env var
+# 2. CONVERSATION_ID env var (Hermes agents get this from zo-hermes/server.py)
 if [[ -z "$CONV_ID" && -n "${CONVERSATION_ID:-}" ]]; then
   CONV_ID="$CONVERSATION_ID"
 elif [[ -z "$CONV_ID" && -n "${ZO_CONVERSATION_ID:-}" ]]; then
   CONV_ID="$ZO_CONVERSATION_ID"
 fi
 
-
-# 4. Fallback: let the bot auto-resolve from in-flight conversations
+# No more fallbacks — error out
 if [[ -z "$CONV_ID" ]]; then
-  CONV_ID="auto"
+  echo "Error: Could not detect conversation ID." >&2
+  echo "Pass --conv-id <id> (check your system prompt's <conversation_workspace> section for the ID)." >&2
+  exit 1
 fi
 
 case "$CMD" in

@@ -26,7 +26,6 @@ from zo_discord.db import (
     get_channel_config, set_channel_config, delete_channel_config,
     update_thread_status, get_thread_status, get_mapping_by_conversation,
     set_watched, is_watched, get_all_watched_threads,
-    set_processing, get_processing_conversation,
 )
 from zo_discord.zo_client import ZoClient, load_config
 from zo_discord.commands import setup_commands
@@ -159,13 +158,15 @@ class ButtonCallbackView(ui.View):
 
                     task = asyncio.current_task()
                     self.bot._inflight[self.thread_id] = {"conv_id": conv_id, "task": task}
-                    await set_processing(self.thread_id, True)
 
                     stop_event = asyncio.Event()
                     typing_task = asyncio.create_task(self.bot.typing_loop(thread, stop_event))
                     try:
                         choice_msg = f"[Button pressed: {label} (id: {button_id})]"
-                        context, file_paths = await self.bot.build_thread_context(thread, include_source=False)
+                        btn_backend = None
+                        if thread.parent:
+                            _, _, btn_backend = await self.bot.resolve_channel_defaults(str(thread.parent.id))
+                        context, file_paths = await self.bot.build_thread_context(thread, include_source=False, conv_id=conv_id, backend=btn_backend or "")
                         result = await self.bot.zo.ask_stream(
                             choice_msg,
                             conversation_id=conv_id,
@@ -199,7 +200,6 @@ class ButtonCallbackView(ui.View):
                         await self.bot.set_status(thread, "error")
                     finally:
                         self.bot._inflight.pop(self.thread_id, None)
-                        await set_processing(self.thread_id, False)
                         stop_event.set()
                         await typing_task
         return callback
@@ -702,12 +702,11 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": "", "task": task}
-        await set_processing(thread_id, True)
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
         try:
-            context, file_paths = await self.build_channel_context(message.channel)
+            context, file_paths = await self.build_channel_context(message.channel, backend=channel_backend)
             if attachment_paths:
                 file_paths.extend(attachment_paths)
 
@@ -764,7 +763,6 @@ class ZoDiscordBot(commands.Bot):
                 pass
         finally:
             self._inflight.pop(thread_id, None)
-            await set_processing(thread_id, False)
             stop_event.set()
             try:
                 await typing_task
@@ -842,12 +840,11 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": "", "task": task}
-        await set_processing(thread_id, True)
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
         try:
-            context, file_paths = await self.build_channel_context(channel)
+            context, file_paths = await self.build_channel_context(channel, backend=channel_backend)
             file_paths.extend(all_attachment_paths)
 
             result = await self.zo.ask_stream(
@@ -900,7 +897,6 @@ class ZoDiscordBot(commands.Bot):
                 pass
         finally:
             self._inflight.pop(thread_id, None)
-            await set_processing(thread_id, False)
             stop_event.set()
             try:
                 await typing_task
@@ -975,7 +971,7 @@ class ZoDiscordBot(commands.Bot):
             effective_persona = config.get("default_persona")
 
         is_first_reply = conv_id == ""
-        context, file_paths = await self.build_thread_context(thread, include_source=is_first_reply)
+        context, file_paths = await self.build_thread_context(thread, include_source=is_first_reply, conv_id=conv_id, backend=channel_backend)
 
         if conv_id == "":
             notification_texts = []
@@ -1037,7 +1033,6 @@ class ZoDiscordBot(commands.Bot):
 
         task = asyncio.current_task()
         self._inflight[thread_id] = {"conv_id": conv_id or "", "task": task}
-        await set_processing(thread_id, True)
 
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
@@ -1154,7 +1149,6 @@ class ZoDiscordBot(commands.Bot):
                 await self.set_status(thread, "error")
         finally:
             self._inflight.pop(thread_id, None)
-            await set_processing(thread_id, False)
             stop_event.set()
             try:
                 await typing_task
@@ -1268,7 +1262,7 @@ class ZoDiscordBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error draining message queue for thread {thread_id}: {e}", exc_info=True)
 
-    async def build_channel_context(self, channel: discord.TextChannel, include_source: bool = True, thread: discord.Thread = None) -> tuple[str, list[str]]:
+    async def build_channel_context(self, channel: discord.TextChannel, include_source: bool = True, thread: discord.Thread = None, conv_id: str = "", backend: str = "") -> tuple[str, list[str]]:
         """Build context string and file paths for the /zo/ask endpoint.
 
         Returns:
@@ -1283,6 +1277,15 @@ class ZoDiscordBot(commands.Bot):
         channel_dir_str = str(channel_dir)
         channel_mention = "<#" + str(channel.id) + ">"
 
+        # Hermes agents have CONVERSATION_ID set as an env var by zo-hermes/server.py,
+        # so the CLI auto-resolves without --conv-id. Only Zo agents need the flag.
+        is_hermes = backend == "hermes"
+        conv_flag = f" --conv-id {conv_id}" if conv_id and not is_hermes else ""
+        if conv_id or is_hermes:
+            conv_hint = ""
+        else:
+            conv_hint = " (find your conversation ID in the <conversation_workspace> section of your system prompt)"
+
         if include_source:
             # === FIRST MESSAGE: full context ===
 
@@ -1290,7 +1293,8 @@ class ZoDiscordBot(commands.Bot):
                 "## Message Source\n"
                 "This message is from Discord (channel: " + channel_mention + "). "
                 "Reply normally \u2014 your response will appear in the thread. "
-                'Before replying, rename the thread with `zo-discord rename "Descriptive Title"` '
+                'Before replying, rename the thread with `zo-discord' + conv_flag + ' rename "Descriptive Title"`'
+                + conv_hint + " "
                 "(3-6 words, specific and scannable)."
             )
 
@@ -1320,7 +1324,7 @@ class ZoDiscordBot(commands.Bot):
                 "For more tools to interact with Discord, like spawning new threads and "
                 "presenting the user with button forms, see the zo-discord skill.\n\n"
                 "When you generate files (images, documents, etc.), send them into the thread with:\n"
-                '`zo-discord files /path/to/file.png "Optional caption"`\n\n'
+                '`zo-discord' + conv_flag + ' files /path/to/file.png "Optional caption"`\n\n'
                 "Run `zo-discord help` for the full command list."
             )
 
@@ -1333,14 +1337,14 @@ class ZoDiscordBot(commands.Bot):
                     "This message is from Discord (channel: " + channel_mention + "; "
                     'thread: "' + clean_name + '"). '
                     "Reply normally. "
-                    'If the topic has shifted from the thread name, rename first: `zo-discord rename "New Title"`\n'
-                    'Send generated files: `zo-discord files /path/to/file "caption"` | '
+                    'If the topic has shifted from the thread name, rename first: `zo-discord' + conv_flag + ' rename "New Title"`\n'
+                    'Send generated files: `zo-discord' + conv_flag + ' files /path/to/file "caption"` | '
                     "Full CLI help: `zo-discord help`"
                 )
 
         return "\n\n".join(sections), file_paths
 
-    async def build_thread_context(self, thread: discord.Thread, include_source: bool = False) -> tuple[str, list[str]]:
+    async def build_thread_context(self, thread: discord.Thread, include_source: bool = False, conv_id: str = "", backend: str = "") -> tuple[str, list[str]]:
         """Build context string and file paths for a thread message.
 
         Returns:
@@ -1351,7 +1355,7 @@ class ZoDiscordBot(commands.Bot):
 
         if thread.parent:
             parent_ctx, parent_paths = await self.build_channel_context(
-                thread.parent, include_source=include_source, thread=thread
+                thread.parent, include_source=include_source, thread=thread, conv_id=conv_id, backend=backend
             )
             if parent_ctx:
                 sections.append(parent_ctx)
@@ -1399,21 +1403,6 @@ class ZoDiscordBot(commands.Bot):
             except (discord.NotFound, discord.Forbidden):
                 return None
         return thread if isinstance(thread, discord.Thread) else None
-
-    async def resolve_conv_id_from_request(self, request: web.Request) -> tuple[str | None, web.Response | None]:
-        """Extract conv_id from request path, auto-resolving 'auto' via the database.
-
-        Uses the `processing` flag in thread_mappings to find the active conversation.
-        Returns (conv_id, error_response). If conv_id is set, error_response is None.
-        """
-        conv_id = request.match_info["conv_id"]
-        if conv_id != "auto":
-            return conv_id, None
-        resolved, err = await get_processing_conversation()
-        if resolved:
-            return resolved, None
-        status = 404 if "No active" in err else 409
-        return None, web.json_response({"error": err}, status=status)
 
     # ─── HTTP Server ──────────────────────────────────────────────────────
 
@@ -1498,11 +1487,6 @@ class ZoDiscordBot(commands.Bot):
             title = data.get("title", "Notification")[:100]
             content = data.get("content", "")
             conversation_id = data.get("conversation_id", "")
-
-            # Auto-resolve conversation ID from active processing flag in DB
-            if conversation_id == "auto":
-                resolved, _ = await get_processing_conversation()
-                conversation_id = resolved or ""
 
             # Reject if this conversation already has a linked Discord thread
             if conversation_id:
@@ -1919,9 +1903,7 @@ class ZoDiscordBot(commands.Bot):
         {"action": "error|complete"}
         {"action": "send", "content": "message"}
         """
-        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
-        if err_resp is not None:
-            return err_resp
+        conv_id = request.match_info["conv_id"]
         try:
             data = await request.json()
             action = data.get("action")
@@ -1995,9 +1977,7 @@ class ZoDiscordBot(commands.Bot):
             "message": "Optional text"
         }
         """
-        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
-        if err_resp is not None:
-            return err_resp
+        conv_id = request.match_info["conv_id"]
         try:
             data = await request.json()
             file_path = Path(data.get("file_path", ""))
@@ -2046,9 +2026,7 @@ class ZoDiscordBot(commands.Bot):
             "channel_name": "optional — resolve by name instead of ID"
         }
         """
-        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
-        if err_resp is not None:
-            return err_resp
+        conv_id = request.match_info["conv_id"]
         try:
             data = await request.json()
             title = data.get("title", "New Thread")[:100]
@@ -2094,10 +2072,10 @@ class ZoDiscordBot(commands.Bot):
                 thread_name=title
             )
 
-            context, file_paths = await self.build_channel_context(channel, include_source=True, thread=thread)
-
             # Resolve channel model/persona defaults
             channel_model, channel_persona, channel_backend = await self.resolve_channel_defaults(str(channel.id))
+
+            context, file_paths = await self.build_channel_context(channel, include_source=True, thread=thread, backend=channel_backend or "")
             config = load_config()
             effective_persona = channel_persona or config.get("default_persona")
 
@@ -2157,9 +2135,7 @@ class ZoDiscordBot(commands.Bot):
             "preset": "approve_reject"  // optional, overrides buttons
         }
         """
-        conv_id, err_resp = await self.resolve_conv_id_from_request(request)
-        if err_resp is not None:
-            return err_resp
+        conv_id = request.match_info["conv_id"]
         try:
             data = await request.json()
 
