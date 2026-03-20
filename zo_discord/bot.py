@@ -2536,6 +2536,8 @@ class ZoDiscordBot(commands.Bot):
             await set_channel_config(str(channel_id), **data)
             config = await get_channel_config(str(channel_id))
             return web.json_response({"success": True, "config": config})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             logger.error(f"Config endpoint error: {e}")
             return web.json_response({"error": str(e)}, status=500)
@@ -2560,6 +2562,8 @@ class ZoDiscordBot(commands.Bot):
             await set_channel_config(channel_id, **data)
             config = await get_channel_config(channel_id)
             return web.json_response({"success": True, "config": config})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             logger.error(f"Set channel config error: {e}")
             return web.json_response({"error": str(e)}, status=500)

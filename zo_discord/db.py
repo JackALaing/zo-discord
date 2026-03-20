@@ -5,12 +5,77 @@ Maps Discord thread IDs to Zo conversation IDs for session persistence.
 
 import aiosqlite
 import os
+import json
 from datetime import datetime
 from pathlib import Path
 
 from zo_discord import PROJECT_ROOT
 
 DB_PATH = PROJECT_ROOT / "data" / "threads.db"
+VALID_REASONING_LEVELS = {"off", "low", "medium", "high"}
+VALID_BACKENDS = {"zo", "hermes"}
+VALID_MESSAGE_MODES = {"queue", "interrupt"}
+
+
+def _parse_json_list(value, field_name: str):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError(f"{field_name} must be a list of strings")
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{field_name} must be valid JSON: {e.msg}") from e
+        if not isinstance(parsed, list):
+            raise ValueError(f"{field_name} must decode to a JSON list")
+        if not all(isinstance(item, str) for item in parsed):
+            raise ValueError(f"{field_name} must be a list of strings")
+        return parsed
+    raise ValueError(f"{field_name} must be a list or JSON-encoded list")
+
+
+def _validate_channel_config_kwargs(kwargs: dict) -> dict:
+    normalized = dict(kwargs)
+
+    if "reasoning" in normalized:
+        value = normalized["reasoning"]
+        if value is not None and value not in VALID_REASONING_LEVELS:
+            raise ValueError(f"reasoning must be one of {sorted(VALID_REASONING_LEVELS)}")
+
+    if "backend" in normalized:
+        value = normalized["backend"]
+        if value is not None and value not in VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {sorted(VALID_BACKENDS)}")
+
+    if "message_mode" in normalized:
+        value = normalized["message_mode"]
+        if value not in VALID_MESSAGE_MODES:
+            raise ValueError(f"message_mode must be one of {sorted(VALID_MESSAGE_MODES)}")
+
+    if "max_iterations" in normalized:
+        value = normalized["max_iterations"]
+        if value is not None:
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError("max_iterations must be an integer >= 1")
+
+    if "skip_memory" in normalized:
+        value = normalized["skip_memory"]
+        if value is not None and not isinstance(value, bool):
+            raise ValueError("skip_memory must be a boolean")
+
+    if "skip_context" in normalized:
+        value = normalized["skip_context"]
+        if value is not None and not isinstance(value, bool):
+            raise ValueError("skip_context must be a boolean")
+
+    for field_name in ("memory_paths", "enabled_toolsets", "disabled_toolsets"):
+        if field_name in normalized:
+            normalized[field_name] = _parse_json_list(normalized[field_name], field_name)
+
+    return normalized
 
 
 async def init_db():
@@ -219,9 +284,8 @@ async def get_channel_config(channel_id: str) -> dict | None:
 
 
 async def set_channel_config(channel_id: str, **kwargs) -> None:
-    import json
     now = datetime.utcnow().isoformat()
-    
+    kwargs = _validate_channel_config_kwargs(kwargs)
     existing = await get_channel_config(channel_id)
     
     if "memory_paths" in kwargs and isinstance(kwargs["memory_paths"], list):
