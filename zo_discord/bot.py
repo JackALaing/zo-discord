@@ -1041,7 +1041,7 @@ class ZoDiscordBot(commands.Bot):
                 # Poll /status to confirm the agent actually stopped, rather
                 # than relying on a blind timeout.
                 if session_id:
-                    for poll in range(10):  # up to 15s (10 * 1.5s)
+                    for poll in range(20):  # up to 30s (20 * 1.5s)
                         status = await check_hermes_status(session_id)
                         if status is None or status.get("state") != "running":
                             break
@@ -1482,7 +1482,7 @@ class ZoDiscordBot(commands.Bot):
         Polls /status to determine agent state before each retry attempt.
         If the agent is still running, waits instead of sending a retry.
         """
-        max_polls = 12  # up to ~2 minutes of polling (12 * 10s)
+        max_polls = 30  # up to ~5 minutes of polling (30 * 10s)
         poll_interval = 10  # seconds between status checks
         max_retries = 3
         retries_used = 0
