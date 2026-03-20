@@ -359,7 +359,7 @@ Toggle with `/queue` and `/interrupt` slash commands.
 The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 
 - **`bot.py`**: `resolve_channel_defaults()` returns four values (`model`, `persona`, `backend`, `hermes_params`). The `hermes_params` dict is passed through to `ask_stream()` via `**kwargs`. The HTTP server exposes `POST /config` for agent-driven config updates (`{"channel_id": "...", "key": "value"}`).
-- **`zo_client.py`**: Imports from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`, `is_hermes`, `HERMES_URL`). The `ask_stream()` method accepts a `backend` parameter plus Hermes-specific params (`reasoning_effort`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`) which are included in the API payload when set. Before each `/ask` call to Hermes, a fast health check (`GET /health`, 2s timeout) verifies the service is reachable — if not, the user sees an immediate error instead of a 30-minute timeout. In interrupt mode, the health check also gates the replacement `/ask` call after cancelling the previous session.
+- **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter plus Hermes-specific params (`reasoning_effort`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`) which are included in the API payload when set.
 - **`db.py`**: The `channel_config` table stores Hermes params alongside existing fields. `enabled_toolsets` and `disabled_toolsets` are stored as JSON strings and deserialized to lists on read.
 
 ### Dependencies
