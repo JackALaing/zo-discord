@@ -29,6 +29,7 @@ from zo_discord.db import (
     set_watched, is_watched, get_all_watched_threads,
 )
 from zo_discord.zo_client import ZoClient, load_config
+from zo_discord.hermes import check_hermes_status, check_hermes_health, is_hermes
 from zo_discord.commands import setup_commands
 from zo_discord.utils import (
     STATUS_EMOJI, set_thread_status_prefix, strip_status_prefix,
@@ -1036,10 +1037,22 @@ class ZoDiscordBot(commands.Bot):
                     except Exception as e:
                         logger.error(f"Failed to cancel session {session_id}: {e}")
 
-                # Wait for the inflight task to finish (it should exit after cancel)
+                # Wait for the agent to become idle (status-gated)
+                # Poll /status to confirm the agent actually stopped, rather
+                # than relying on a blind timeout.
+                if session_id:
+                    for poll in range(10):  # up to 15s (10 * 1.5s)
+                        status = await check_hermes_status(session_id)
+                        if status is None or status.get("state") != "running":
+                            break
+                        await asyncio.sleep(1.5)
+                    else:
+                        logger.warning(f"Agent still running after cancel polls for session {session_id}")
+
+                # Also wait for the inflight asyncio task to finish
                 if inflight_task and not inflight_task.done():
                     try:
-                        await asyncio.wait_for(asyncio.shield(inflight_task), timeout=15)
+                        await asyncio.wait_for(asyncio.shield(inflight_task), timeout=5)
                     except (asyncio.TimeoutError, Exception) as e:
                         logger.warning(f"Inflight task didn't finish cleanly after cancel: {e}")
 
@@ -1402,8 +1415,13 @@ class ZoDiscordBot(commands.Bot):
     ) -> tuple[str, str]:
         """Recover from an empty or interrupted response.
 
-        Sends a continuation message (bundling any queued user messages)
-        via streaming to nudge the agent into producing output.
+        For Hermes backend: polls /status to check if the agent is still
+        running or idle before deciding whether to retry. This avoids
+        blindly sending "please continue" while the agent is mid-work.
+
+        - Agent running → wait and poll again (don't waste a retry)
+        - Agent idle → safe to send continuation
+        - Hermes unreachable → surface error, stop retrying
         """
         queued_parts = self._collect_queued_text(thread_id)
         if queued_parts:
@@ -1416,6 +1434,14 @@ class ZoDiscordBot(commands.Bot):
                 "please respond with your results."
             )
 
+        use_hermes = is_hermes(backend, self.zo.backend)
+
+        if use_hermes:
+            return await self._retry_with_status_gate(
+                conv_id, thread_id, retry_input, on_thinking, on_conv_id, backend,
+            )
+
+        # Non-Hermes: original blind retry logic
         retry_delays = [30, 60, 120]
         for attempt, delay in enumerate(retry_delays, 1):
             logger.warning(f"Empty response (conv {conv_id}), continue attempt {attempt}/{len(retry_delays)} in {delay}s")
@@ -1440,6 +1466,80 @@ class ZoDiscordBot(commands.Bot):
                 logger.error(f"Continue attempt {attempt} failed for conv {conv_id}: {e}")
 
         logger.error(f"All retries exhausted for conv {conv_id}")
+        return "", conv_id
+
+    async def _retry_with_status_gate(
+        self,
+        conv_id: str,
+        thread_id: str,
+        retry_input: str,
+        on_thinking,
+        on_conv_id,
+        backend: str,
+    ) -> tuple[str, str]:
+        """Status-gated retry for Hermes backend.
+
+        Polls /status to determine agent state before each retry attempt.
+        If the agent is still running, waits instead of sending a retry.
+        """
+        max_polls = 12  # up to ~2 minutes of polling (12 * 10s)
+        poll_interval = 10  # seconds between status checks
+        max_retries = 3
+        retries_used = 0
+
+        for poll in range(max_polls):
+            await asyncio.sleep(poll_interval)
+
+            status = await check_hermes_status(conv_id)
+
+            if status is None:
+                # Hermes unreachable — check if it's completely down
+                alive = await check_hermes_health()
+                if not alive:
+                    logger.error(f"Hermes unreachable during retry for conv {conv_id}")
+                    return "⚠️ zo-hermes is not responding. The service may need to be restarted.", conv_id
+                # Health OK but session not found — treat as idle (session may have expired)
+                logger.info(f"Hermes healthy but session {conv_id} not found, treating as idle")
+                agent_state = "idle"
+            else:
+                agent_state = status.get("state", "idle")
+                iterations = status.get("iterations_used", "?")
+                max_iter = status.get("iterations_max", "?")
+                logger.info(f"Hermes status for {conv_id}: state={agent_state}, iterations={iterations}/{max_iter}")
+
+            if agent_state == "running":
+                logger.info(f"Agent still running for conv {conv_id}, waiting (poll {poll + 1}/{max_polls})")
+                continue
+
+            # Agent is idle — safe to send a retry
+            if retries_used >= max_retries:
+                logger.error(f"All {max_retries} retries exhausted for conv {conv_id}")
+                return "", conv_id
+
+            retries_used += 1
+            logger.warning(f"Agent idle with empty response, retry {retries_used}/{max_retries} for conv {conv_id}")
+
+            try:
+                result = await self.zo.ask_stream(
+                    retry_input,
+                    conversation_id=conv_id,
+                    on_thinking=on_thinking,
+                    on_conv_id=on_conv_id,
+                    backend=backend,
+                )
+                if result.conv_id != conv_id:
+                    await update_conversation_id(thread_id, result.conv_id)
+                    conv_id = result.conv_id
+
+                if result.output and result.output.strip():
+                    logger.info(f"Status-gated retry {retries_used} succeeded for conv {conv_id}")
+                    return result.output, conv_id
+                # Empty again — loop back to poll status
+                logger.warning(f"Retry {retries_used} returned empty, will poll status again")
+            except Exception as e:
+                logger.error(f"Retry {retries_used} failed for conv {conv_id}: {e}")
+
+        logger.error(f"Status polling exhausted ({max_polls} polls) for conv {conv_id}")
         return "", conv_id
 
     async def _drain_queue(self, thread_id: str):

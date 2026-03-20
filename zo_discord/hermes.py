@@ -8,12 +8,48 @@ zo-hermes service: http://127.0.0.1:8788 (Zo service svc_bInt4_9RgFI)
 See Knowledge/zo/Hermes/zo-hermes-skill-draft.md for full documentation.
 """
 
+import aiohttp
 import logging
 
 logger = logging.getLogger(__name__)
 
 # zo-hermes endpoint (localhost only, no auth)
 HERMES_URL = "http://127.0.0.1:8788"
+
+
+async def check_hermes_status(session_id: str) -> dict | None:
+    """Check zo-hermes agent status for a session.
+
+    Returns dict with 'state' ('running'|'idle'), 'iterations_used', etc.
+    Returns None if hermes is unreachable or session not found.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{HERMES_URL}/status",
+                params={"session_id": session_id},
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                logger.warning(f"Hermes /status returned {resp.status} for session {session_id}")
+                return None
+    except Exception as e:
+        logger.warning(f"Hermes /status unreachable for session {session_id}: {e}")
+        return None
+
+
+async def check_hermes_health() -> bool:
+    """Basic liveness check — is zo-hermes responding?"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{HERMES_URL}/health",
+                timeout=aiohttp.ClientTimeout(total=2),
+            ) as resp:
+                return resp.status == 200
+    except Exception:
+        return False
 
 
 def is_hermes(backend: str | None, default_backend: str = "zo") -> bool:
