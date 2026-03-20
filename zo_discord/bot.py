@@ -210,6 +210,46 @@ class ButtonCallbackView(ui.View):
         return callback
 
 
+class ClarifyButtonView(ui.View):
+    """Presents clarify choices as Discord buttons. Resolves the pending clarify future directly."""
+
+    def __init__(self, choices: list[str], future: asyncio.Future, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.future = future
+        for i, choice in enumerate(choices):
+            btn = ui.Button(label=choice[:80], style=discord.ButtonStyle.primary, row=i // 4)
+            btn.callback = self._make_choice_callback(choice)
+            self.add_item(btn)
+        other_btn = ui.Button(label="Other", style=discord.ButtonStyle.secondary, row=(len(choices)) // 4)
+        other_btn.callback = self._make_other_callback()
+        self.add_item(other_btn)
+
+    def _make_choice_callback(self, choice: str):
+        async def callback(interaction: discord.Interaction):
+            if self.future.done():
+                await interaction.response.edit_message(content="*Already answered.*", view=None)
+                return
+            self.future.set_result(choice)
+            await interaction.response.edit_message(
+                content=f"**{interaction.user.display_name}** selected: **{choice}**", view=None
+            )
+        return callback
+
+    def _make_other_callback(self):
+        async def callback(interaction: discord.Interaction):
+            if self.future.done():
+                await interaction.response.edit_message(content="*Already answered.*", view=None)
+                return
+            await interaction.response.edit_message(
+                content="*Type your answer below:*", view=None
+            )
+        return callback
+
+    async def on_timeout(self):
+        if not self.future.done():
+            pass
+
+
 class ZoDiscordBot(commands.Bot):
 
     def __init__(self):
@@ -1567,23 +1607,17 @@ class ZoDiscordBot(commands.Bot):
         thread_id = str(thread.id)
 
         async def on_clarify(question: str, choices: list, session_id: str) -> str:
-            # Format the clarify message
-            msg_parts = [f"❓ **Clarification needed:**\n\n{question}"]
-            if choices:
-                for i, choice in enumerate(choices, 1):
-                    msg_parts.append(f"  {i}. {choice}")
-                msg_parts.append(f"  {len(choices) + 1}. Other (type your answer)")
-                msg_parts.append("\n*Reply with a number or type your answer:*")
-            else:
-                msg_parts.append("\n*Type your response:*")
-
-            await send_suppressed(thread, content="\n".join(msg_parts))
-
-            # Wait for the user's reply via a Future
             future = asyncio.get_event_loop().create_future()
             self._pending_clarify[thread_id] = future
+
+            if choices:
+                view = ClarifyButtonView(choices, future)
+                await send_suppressed(thread, content=f"❓ **Clarification needed:**\n\n{question}", view=view)
+            else:
+                await send_suppressed(thread, content=f"❓ **Clarification needed:**\n\n{question}\n\n*Type your response:*")
+
             try:
-                user_response = await asyncio.wait_for(future, timeout=120)
+                return await asyncio.wait_for(future, timeout=120)
             except asyncio.TimeoutError:
                 await send_suppressed(thread, content="*Clarify timed out — agent will decide.*")
                 return (
@@ -1592,14 +1626,6 @@ class ZoDiscordBot(commands.Bot):
                 )
             finally:
                 self._pending_clarify.pop(thread_id, None)
-
-            # If choices were offered and user replied with a number, resolve it
-            if choices and user_response.strip().isdigit():
-                idx = int(user_response.strip()) - 1
-                if 0 <= idx < len(choices):
-                    return choices[idx]
-                # If they picked the "Other" number, it's the same as freeform
-            return user_response
 
         return on_clarify
 

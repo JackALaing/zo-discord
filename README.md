@@ -16,7 +16,7 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 - **Message queuing** — Send multiple messages while Zo is thinking. They're batched and delivered when the current turn finishes.
 - **Reply context** — Reply to a specific message in a thread and Zo sees which message you're responding to.
 - **File attachments** — Attach files to your messages and Zo will receive them.
-- **Agent clarifications** — When Hermes needs clarification, the question is posted to the thread (with numbered choices if applicable). Your reply resolves the question and the agent continues seamlessly. 120s timeout.
+- **Agent clarifications** — When Hermes needs clarification, the question is posted to the thread. Multiple-choice questions render as Discord buttons (up to 4 choices plus "Other"); open-ended questions accept a typed reply. Clicking a button or sending a message resolves the question and the agent continues seamlessly. 120s timeout.
 - **Discord formatting** — Markdown is automatically reformatted for Discord: tables become bullet outlines or code blocks, footnotes become inline links, link embeds are suppressed, and task lists are converted to plain lists.
 
 ### Configuration
