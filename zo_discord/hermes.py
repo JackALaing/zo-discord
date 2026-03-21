@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 # zo-hermes endpoint (localhost only, no auth)
 HERMES_URL = "http://127.0.0.1:8788"
+HERMES_DEFAULT_MODEL = "gpt-5.4"
 
 
 async def check_hermes_status(session_id: str) -> dict | None:
@@ -88,6 +89,18 @@ def get_backend_label(backend: str | None, default_backend: str = "zo") -> str:
     return "Hermes" if is_hermes(backend, default_backend) else "Zo"
 
 
+def get_model_fallback_notice(requested_model: str | None, backend: str | None, default_backend: str = "zo") -> str | None:
+    """Explain when Hermes must ignore a Zo-style BYOK model ID."""
+    if not is_hermes(backend, default_backend):
+        return None
+    if not requested_model or not requested_model.startswith("byok:"):
+        return None
+    return (
+        f"*Hermes can't use Zo BYOK model IDs (`{requested_model}`), "
+        f"so this turn is falling back to `{HERMES_DEFAULT_MODEL}`.*"
+    )
+
+
 def handle_session_id_change(event_data: dict, current_conv_id: str) -> str | None:
     """
     Check if Hermes changed the session ID (due to context compression).
@@ -107,5 +120,4 @@ def handle_session_id_change(event_data: dict, current_conv_id: str) -> str | No
         logger.info("Session ID changed (compression): %s -> %s", current_conv_id, new_conv)
         return new_conv
     return None
-
 

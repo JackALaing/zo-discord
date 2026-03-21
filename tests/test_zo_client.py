@@ -94,6 +94,24 @@ class TestSentenceCounting:
         assert _count_sentences("One sentence.") == 1
 
 
+class TestPathDeduplication:
+    def test_dedupe_file_paths_keeps_first_alias(self):
+        from zo_discord.zo_client import _dedupe_file_paths
+
+        deduped = _dedupe_file_paths(
+            [
+                "/home/workspace/Skills/zo-discord",
+                "/home/workspace/Services/zo-discord/skill",
+                "/home/workspace/Knowledge/memory/a.md",
+            ]
+        )
+
+        assert deduped == [
+            "/home/workspace/Skills/zo-discord",
+            "/home/workspace/Knowledge/memory/a.md",
+        ]
+
+
 # ── StreamResult dataclass ───────────────────────────────────────────
 
 
@@ -168,7 +186,10 @@ class TestAskStream:
         client = self._make_client()
         capture = {}
         response = FakeResponse(
-            headers={"X-Conversation-Id": "conv-1"},
+            headers={
+                "X-Conversation-Id": "conv-1",
+                "X-Model-Fallback": "Hermes cannot use requested model byok:test; falling back to gpt-5.4.",
+            },
             chunks=[
                 b'event: End\n',
                 b'data: {"data": {"output": "hello", "conversation_id": "conv-1"}}\n',
@@ -183,7 +204,7 @@ class TestAskStream:
                     "Hi",
                     conversation_id="conv-1",
                     context="Extra context",
-                    file_paths=["/home/workspace/a.md"],
+                    file_paths=["/home/workspace/Skills/zo-discord", "/home/workspace/Services/zo-discord/skill"],
                     backend="hermes",
                     reasoning_effort="high",
                     max_iterations=7,
@@ -195,6 +216,7 @@ class TestAskStream:
             )
 
         assert result.output == "hello"
+        assert result.model_fallback.startswith("Hermes cannot use requested model")
         payload = capture["json"]
         assert payload["conversation_id"] == "conv-1"
         assert payload["reasoning_effort"] == "high"
@@ -204,7 +226,7 @@ class TestAskStream:
         assert payload["enabled_toolsets"] == ["web", "terminal"]
         assert payload["disabled_toolsets"] == ["rl"]
         assert payload["input"] == "Hi"
-        assert payload["ephemeral_system_prompt"] == "Extra context\n\n## Referenced Files\n- `/home/workspace/a.md`"
+        assert payload["ephemeral_system_prompt"] == "Extra context\n\n## Referenced Files\n- `/home/workspace/Skills/zo-discord`"
 
     def test_payload_keeps_context_in_input_for_non_hermes(self):
         client = self._make_client()

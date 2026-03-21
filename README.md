@@ -161,7 +161,9 @@ zo-discord notify "Title" "content" --channel-name general  — Post to a new th
 zo-discord notify "Title" --file /tmp/out.md --channel-name pulse  — Post file contents
 zo-discord --conv-id <id> buttons "Prompt?" "Yes:success" "No:danger" — Send interactive buttons
 zo-discord --conv-id <id> buttons "Prompt?" --preset yes_no           — Use a button preset
-zo-discord --conv-id <id> new-thread "Title" "prompt"  — Spawn a new thread
+zo-discord --conv-id <id> new-thread "Title" "prompt" --channel-name general  — Spawn a new thread
+zo-discord --conv-id <id> new-thread "Title" --prompt-file /tmp/prompt.md --channel-name general  — Read prompt from file
+cat /tmp/prompt.md | zo-discord --conv-id <id> new-thread "Title" --channel-name general  — Read prompt from stdin
 ```
 
 See `skill/SKILL.md` for full HTTP API documentation.

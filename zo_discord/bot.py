@@ -29,7 +29,12 @@ from zo_discord.db import (
     set_watched, is_watched, get_all_watched_threads,
 )
 from zo_discord.zo_client import ZoClient, load_config
-from zo_discord.hermes import check_hermes_status, check_hermes_health, is_hermes
+from zo_discord.hermes import (
+    check_hermes_status,
+    check_hermes_health,
+    get_model_fallback_notice,
+    is_hermes,
+)
 from zo_discord.commands import setup_commands
 from zo_discord.utils import (
     STATUS_EMOJI, set_thread_status_prefix, strip_status_prefix,
@@ -155,6 +160,8 @@ class ButtonCallbackView(ui.View):
                     async def on_conv_id(cid: str):
                         if cid != conv_id:
                             await update_conversation_id(self.thread_id, cid)
+                            if self.bot._needs_thread_digest(conv_id, cid):
+                                self.bot._thread_digest_needed.add(self.thread_id)
                         if self.thread_id in self.bot._inflight:
                             self.bot._inflight[self.thread_id]["conv_id"] = cid
 
@@ -184,6 +191,8 @@ class ButtonCallbackView(ui.View):
                         response, new_conv_id = result.output, result.conv_id
                         if new_conv_id != conv_id:
                             await update_conversation_id(self.thread_id, new_conv_id)
+                            if self.bot._needs_thread_digest(conv_id, new_conv_id):
+                                self.bot._thread_digest_needed.add(self.thread_id)
                         await update_activity(self.thread_id)
 
                         if not response or not response.strip():
@@ -191,12 +200,16 @@ class ButtonCallbackView(ui.View):
                             response, new_conv_id = await self.bot._retry_empty_response(
                                 self.thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
                             )
+                            if response is None:
+                                logger.info(f"Cancelled button callback turn in thread {self.thread_id}; not sending retry or fallback")
+                                return
 
                         chunks = self.bot.zo.chunk_response(response)
                         chunks = [c for c in chunks if c.strip()]
                         if not chunks:
                             logger.error(f"All retries exhausted for button callback conv {conv_id}")
                             chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id or conv_id}`\n\nSend another message to try again."]
+                        await self.bot._send_model_fallback_notice(thread, result.model_fallback)
                         for chunk in chunks:
                             await send_suppressed(thread, content=chunk)
                     except asyncio.CancelledError:
@@ -278,6 +291,8 @@ class ZoDiscordBot(commands.Bot):
         self._presaved_attachments = {}  # message.id -> list[str], pre-saved attachment paths
         self._last_user_messages = {}  # thread_id -> last user message text (for /retry)
         self._pending_clarify = {}  # thread_id -> asyncio.Future for clarify response
+        self._thread_digest_needed = set()  # thread_id values needing one-shot history injection after compression
+        self._cancelled_threads = set()  # thread_id values intentionally cancelled via /stop or interrupt
         self._thinking_mode = self.config.get("thinking_mode", "streaming")
         self._auto_archive_override = self.config.get("auto_archive_override", True)
 
@@ -291,6 +306,16 @@ class ZoDiscordBot(commands.Bot):
         self._TYPING_TIMEOUT = 10.0  # seconds to wait after last on_typing before unpausing
 
         setup_commands(self)
+
+    def mark_thread_cancelled(self, thread_id: str) -> None:
+        self._cancelled_threads.add(str(thread_id))
+
+    def consume_thread_cancelled(self, thread_id: str) -> bool:
+        thread_id = str(thread_id)
+        if thread_id in self._cancelled_threads:
+            self._cancelled_threads.discard(thread_id)
+            return True
+        return False
 
     def extract_overrides(self, text: str) -> tuple[str | None, str | None, str]:
         """Extract /model-alias and @persona-alias prefixes in either order.
@@ -355,6 +380,15 @@ class ZoDiscordBot(commands.Bot):
         if ch_config.get("disabled_toolsets"):
             hermes_params["disabled_toolsets"] = ch_config["disabled_toolsets"]
         return ch_config.get("model"), ch_config.get("persona_id"), ch_config.get("backend"), hermes_params
+
+    async def _send_hermes_model_fallback_notice(self, channel, requested_model: str | None, backend: str | None):
+        notice = get_model_fallback_notice(requested_model, backend, self.zo.backend)
+        if not notice:
+            return
+        try:
+            await send_suppressed(channel, content=notice)
+        except Exception as e:
+            logger.warning(f"Failed to send Hermes model fallback notice: {e}")
 
     async def on_ready(self):
         if not self._initialized:
@@ -770,6 +804,8 @@ class ZoDiscordBot(commands.Bot):
 
         async def on_conv_id(cid: str):
             await update_conversation_id(thread_id, cid)
+            if self._needs_thread_digest(self._inflight.get(thread_id, {}).get("conv_id", ""), cid):
+                self._thread_digest_needed.add(thread_id)
             if thread_id in self._inflight:
                 self._inflight[thread_id]["conv_id"] = cid
 
@@ -784,6 +820,7 @@ class ZoDiscordBot(commands.Bot):
                 file_paths.extend(attachment_paths)
 
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+            await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
@@ -818,6 +855,9 @@ class ZoDiscordBot(commands.Bot):
                         thread_id, conv_id, thread, on_thinking, on_conv_id,
                         backend=channel_backend,
                     )
+                    if response is None:
+                        logger.info(f"Cancelled turn in thread {thread_id}; not sending retry or fallback")
+                        return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
@@ -825,6 +865,7 @@ class ZoDiscordBot(commands.Bot):
                 # All retries exhausted — show fallback
                 logger.error(f"All retries exhausted for conv {conv_id}")
                 chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\nSend another message to try again."]
+            await self._send_model_fallback_notice(thread, result.model_fallback)
             for chunk in chunks:
                 await send_suppressed(thread, content=chunk)
             logger.info(f"Sent response in thread {thread.id}, conv_id {conv_id}")
@@ -911,6 +952,8 @@ class ZoDiscordBot(commands.Bot):
 
         async def on_conv_id(cid: str):
             await update_conversation_id(thread_id, cid)
+            if self._needs_thread_digest(self._inflight.get(thread_id, {}).get("conv_id", ""), cid):
+                self._thread_digest_needed.add(thread_id)
             if thread_id in self._inflight:
                 self._inflight[thread_id]["conv_id"] = cid
 
@@ -924,6 +967,7 @@ class ZoDiscordBot(commands.Bot):
             file_paths.extend(all_attachment_paths)
 
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+            await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
@@ -956,12 +1000,16 @@ class ZoDiscordBot(commands.Bot):
                         thread_id, conv_id, thread, on_thinking, on_conv_id,
                         backend=channel_backend,
                     )
+                    if response is None:
+                        logger.info(f"Cancelled batched turn in thread {thread_id}; not sending retry or fallback")
+                        return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
             if not chunks:
                 logger.error(f"All retries exhausted for conv {conv_id}")
                 chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\nSend another message to try again."]
+            await self._send_model_fallback_notice(thread, result.model_fallback)
             for chunk in chunks:
                 await send_suppressed(thread, content=chunk)
             logger.info(f"Sent response in thread {thread.id}, conv_id {conv_id}")
@@ -1034,6 +1082,8 @@ class ZoDiscordBot(commands.Bot):
                             ) as resp:
                                 cancel_status = resp.status
                                 logger.info(f"Cancel response for session {session_id}: {cancel_status}")
+                                if cancel_status == 200:
+                                    self.mark_thread_cancelled(thread_id)
                     except Exception as e:
                         logger.error(f"Failed to cancel session {session_id}: {e}")
 
@@ -1169,6 +1219,8 @@ class ZoDiscordBot(commands.Bot):
         async def on_conv_id(cid: str):
             if cid != conv_id:
                 await update_conversation_id(thread_id, cid)
+                if self._needs_thread_digest(conv_id, cid):
+                    self._thread_digest_needed.add(thread_id)
             if thread_id in self._inflight:
                 self._inflight[thread_id]["conv_id"] = cid
 
@@ -1181,6 +1233,7 @@ class ZoDiscordBot(commands.Bot):
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
         try:
+            await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
             result = await self.zo.ask_stream(
                 user_input,
                 conversation_id=conv_id if conv_id else None,
@@ -1198,6 +1251,8 @@ class ZoDiscordBot(commands.Bot):
 
             if new_conv_id != conv_id:
                 await update_conversation_id(thread_id, new_conv_id)
+                if self._needs_thread_digest(conv_id, new_conv_id):
+                    self._thread_digest_needed.add(thread_id)
                 if not conv_id:
                     logger.info(f"Started new conversation {new_conv_id} for notification thread")
                 else:
@@ -1214,6 +1269,9 @@ class ZoDiscordBot(commands.Bot):
                         thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
                         backend=channel_backend,
                     )
+                    if response is None:
+                        logger.info(f"Cancelled notification turn in thread {thread_id}; not sending retry or fallback")
+                        return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
@@ -1221,6 +1279,7 @@ class ZoDiscordBot(commands.Bot):
                 # All retries exhausted — show fallback
                 logger.error(f"All retries exhausted for thread {thread.id}")
                 chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id or conv_id}`\n\nSend another message to try again."]
+            await self._send_model_fallback_notice(thread, result.model_fallback)
             for i, chunk in enumerate(chunks):
                 kwargs = {"content": chunk}
                 if i == 0:
@@ -1330,6 +1389,8 @@ class ZoDiscordBot(commands.Bot):
         async def on_conv_id(cid: str):
             if cid != conv_id:
                 await update_conversation_id(thread_id, cid)
+                if self._needs_thread_digest(conv_id, cid):
+                    self._thread_digest_needed.add(thread_id)
             if thread_id in self._inflight:
                 self._inflight[thread_id]["conv_id"] = cid
 
@@ -1339,6 +1400,7 @@ class ZoDiscordBot(commands.Bot):
         stop_event = asyncio.Event()
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
         try:
+            await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
             result = await self.zo.ask_stream(
                 user_input,
                 conversation_id=conv_id,
@@ -1356,6 +1418,8 @@ class ZoDiscordBot(commands.Bot):
 
             if result.conv_id and result.conv_id != conv_id:
                 await update_conversation_id(thread_id, result.conv_id)
+                if self._needs_thread_digest(conv_id, result.conv_id):
+                    self._thread_digest_needed.add(thread_id)
 
             await update_activity(thread_id)
 
@@ -1364,6 +1428,7 @@ class ZoDiscordBot(commands.Bot):
                     response = f"\u26a0\ufe0f **Retry failed.**\n\n`{result.error_message[:200]}`"
 
             if response and response.strip():
+                await self._send_model_fallback_notice(thread, result.model_fallback)
                 chunks = self.zo.chunk_response(response)
                 for chunk in chunks:
                     if chunk.strip():
@@ -1412,7 +1477,7 @@ class ZoDiscordBot(commands.Bot):
         on_thinking,
         on_conv_id,
         backend: str = None,
-    ) -> tuple[str, str]:
+    ) -> tuple[str | None, str]:
         """Recover from an empty or interrupted response.
 
         For Hermes backend: polls /status to check if the agent is still
@@ -1423,6 +1488,10 @@ class ZoDiscordBot(commands.Bot):
         - Agent idle → safe to send continuation
         - Hermes unreachable → surface error, stop retrying
         """
+        if self.consume_thread_cancelled(thread_id):
+            logger.info(f"Skipping empty-response retry for intentionally cancelled thread {thread_id}")
+            return None, conv_id
+
         queued_parts = self._collect_queued_text(thread_id)
         if queued_parts:
             retry_input = " ".join(queued_parts)
@@ -1576,6 +1645,54 @@ class ZoDiscordBot(commands.Bot):
         except Exception as e:
             logger.error(f"Error draining message queue for thread {thread_id}: {e}", exc_info=True)
 
+    def _needs_thread_digest(self, previous_conv_id: str, new_conv_id: str) -> bool:
+        return bool(previous_conv_id and new_conv_id and previous_conv_id != new_conv_id)
+
+    def _skip_thread_digest_message(self, content: str) -> bool:
+        stripped = content.strip()
+        if not stripped:
+            return True
+        if stripped == "# Retried Message":
+            return True
+        if stripped.startswith("*") and stripped.endswith("*"):
+            return True
+        return False
+
+    async def _build_thread_digest(self, thread: discord.Thread) -> str | None:
+        entries = []
+        async for msg in thread.history(limit=60, oldest_first=True):
+            content = (msg.content or "").strip()
+            if self._skip_thread_digest_message(content):
+                continue
+            author = "Zo" if msg.author.bot else msg.author.display_name
+            normalized = re.sub(r"\s+", " ", content)
+            if len(normalized) > 180:
+                normalized = normalized[:177] + "..."
+            entries.append(f"- {author}: {normalized}")
+
+        if len(entries) <= 2:
+            return None
+
+        older_entries = entries[:-2]
+        if len(older_entries) > 8:
+            older_entries = older_entries[-8:]
+
+        return (
+            "## Earlier Thread Summary\n"
+            "This thread was recently compressed. Keep this earlier context in mind:\n"
+            + "\n".join(older_entries)
+        )
+
+    async def _send_model_fallback_notice(self, channel, fallback_message: str) -> None:
+        if not fallback_message:
+            return
+        # Hermes turns already emit the BYOK fallback notice proactively before
+        # streaming begins. Suppress the duplicate late notice from the response
+        # headers so it doesn't appear to be associated with slash commands like /stop.
+        if fallback_message.startswith("Hermes cannot use requested model byok:"):
+            return
+        await send_suppressed(channel, content=f"*{fallback_message}*")
+
     async def build_channel_context(self, channel: discord.TextChannel, include_source: bool = True, thread: discord.Thread = None, conv_id: str = "", backend: str = "") -> tuple[str, list[str]]:
         """Build context string and file paths for the /zo/ask endpoint.
 
@@ -1684,6 +1801,14 @@ class ZoDiscordBot(commands.Bot):
                 sections.append("## Thread Pins\n" + "\n".join(pin_texts))
         except discord.Forbidden:
             pass
+
+        if backend == "hermes":
+            thread_id = str(thread.id)
+            if thread_id in self._thread_digest_needed:
+                digest = await self._build_thread_digest(thread)
+                self._thread_digest_needed.discard(thread_id)
+                if digest:
+                    sections.append(digest)
 
         return "\n\n".join(sections), file_paths
 
@@ -2424,6 +2549,7 @@ class ZoDiscordBot(commands.Bot):
 
             on_thinking = self.make_on_thinking(thread)
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
+            await self._send_hermes_model_fallback_notice(thread, channel_model, channel_backend)
             async def on_conv_id(cid: str):
                 await update_conversation_id(thread_id_str, cid)
 
@@ -2447,6 +2573,9 @@ class ZoDiscordBot(commands.Bot):
                     thread_id_str, new_conv_id, thread, on_thinking, on_conv_id,
                     backend=channel_backend,
                 )
+                if response is None:
+                    logger.info(f"Cancelled new-thread turn in thread {thread_id_str}; not sending retry or fallback")
+                    return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]

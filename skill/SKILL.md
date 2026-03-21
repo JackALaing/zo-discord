@@ -26,9 +26,9 @@ zo-discord <command> [args]
 | `zo-discord buttons "Prompt?" "Label:style" ...` | Send interactive buttons (user's click is injected back) |
 | `zo-discord buttons "Prompt?" --preset yes_no` | Send preset buttons (presets: `yes_no`, `approve_reject`) |
 | `zo-discord files /path/to/file "caption"` | Send a file attachment to the thread (max 25MB) |
-| `zo-discord new-thread "Title" "prompt"` | Spawn a new thread with a fresh Zo session |
+| `zo-discord new-thread "Title" "prompt" --channel-name general` | Spawn a new thread with a fresh Zo session |
 
-Channel targeting: use `--channel-name <name>` (e.g. `general`, `pulse`) or `--channel <id>`. Prefer `--channel-name` — no need to look up IDs.
+Channel targeting: use `--channel-name <name>` (e.g. `general`, `pulse`) or `--channel <id>`. For `new-thread`, channel targeting is required. Prefer `--channel-name` — no need to look up IDs.
 
 Your normal replies are automatically sent to the Discord thread — no need to use a send command.
 
@@ -172,12 +172,14 @@ React with ✅ on any Zo message in a thread to archive it (removes from sidebar
 Start a separate conversation in a new Discord thread from within an existing thread:
 
 ```bash
-zo-discord new-thread "Thread Title" "Context or question for the new thread"
+zo-discord new-thread "Thread Title" "Context or question for the new thread" --channel-name general
 zo-discord new-thread "Title" "Prompt" --channel-name pulse
 zo-discord new-thread "Title" "Prompt" --channel CHANNEL_ID
+zo-discord new-thread "Title" --prompt-file /tmp/prompt.md --channel-name hermes
+cat /tmp/prompt.md | zo-discord new-thread "Title" --channel-name hermes
 ```
 
-The new thread gets its own Zo session with full channel context (instructions, memory paths). The prompt is sent as the first message to the new Zo session, and Zo's response appears in the thread. Defaults to the same channel as the current thread.
+The new thread gets its own Zo session with full channel context (instructions, memory paths). The prompt is sent as the first message to the new Zo session, and Zo's response appears in the thread. For `new-thread`, always pass an explicit `--channel-name` or `--channel`; there is no implicit default.
 
 ## Message Chunking
 

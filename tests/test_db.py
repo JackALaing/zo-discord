@@ -137,3 +137,41 @@ class TestChannelConfig:
             assert "message_mode" in str(e)
         else:
             raise AssertionError("Expected ValueError")
+
+    def test_rejects_bad_backend(self, tmp_path):
+        db = configure_db(tmp_path)
+
+        try:
+            run(db.set_channel_config("channel-1", backend="local"))
+        except ValueError as e:
+            assert "backend" in str(e)
+        else:
+            raise AssertionError("Expected ValueError")
+
+    def test_rejects_non_boolean_skip_flags(self, tmp_path):
+        db = configure_db(tmp_path)
+
+        for field_name in ("skip_memory", "skip_context"):
+            try:
+                run(db.set_channel_config("channel-1", **{field_name: 1}))
+            except ValueError as e:
+                assert field_name in str(e)
+            else:
+                raise AssertionError("Expected ValueError")
+
+    def test_rejects_bad_memory_paths_shapes(self, tmp_path):
+        db = configure_db(tmp_path)
+
+        try:
+            run(db.set_channel_config("channel-1", memory_paths='{"path":"nope"}'))
+        except ValueError as e:
+            assert "memory_paths" in str(e)
+        else:
+            raise AssertionError("Expected ValueError")
+
+        try:
+            run(db.set_channel_config("channel-1", memory_paths=["ok", 3]))
+        except ValueError as e:
+            assert "memory_paths" in str(e)
+        else:
+            raise AssertionError("Expected ValueError")

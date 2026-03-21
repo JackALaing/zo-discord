@@ -19,12 +19,30 @@ from zo_discord.hermes import get_request_config, get_backend_label, handle_sess
 logger = logging.getLogger(__name__)
 
 
+def _dedupe_file_paths(file_paths: list[str] = None) -> list[str]:
+    if not file_paths:
+        return []
+    deduped = []
+    seen = set()
+    for raw_path in file_paths:
+        try:
+            key = str(Path(raw_path).expanduser().resolve(strict=False))
+        except Exception:
+            key = raw_path
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(raw_path)
+    return deduped
+
+
 def _build_hermes_overlay(context: str = None, file_paths: list[str] = None) -> str | None:
     sections = []
     if context:
         sections.append(context)
-    if file_paths:
-        paths_str = "\n".join(f"- `{p}`" for p in file_paths)
+    deduped_paths = _dedupe_file_paths(file_paths)
+    if deduped_paths:
+        paths_str = "\n".join(f"- `{p}`" for p in deduped_paths)
         sections.append(f"## Referenced Files\n{paths_str}")
     if not sections:
         return None
@@ -39,6 +57,7 @@ class StreamResult:
     interrupted: bool  # stream broke before End event
     received_events: bool  # got any SSE events at all
     error_message: str = ""  # SSEErrorEvent message if stream errored
+    model_fallback: str = ""
 
 from zo_discord import PROJECT_ROOT
 
@@ -136,13 +155,14 @@ class ZoClient:
 
         full_input = input_text
         ephemeral_system_prompt = None
+        deduped_file_paths = _dedupe_file_paths(file_paths)
         if is_hermes_backend:
-            ephemeral_system_prompt = _build_hermes_overlay(context, file_paths)
+            ephemeral_system_prompt = _build_hermes_overlay(context, deduped_file_paths)
         else:
             if context:
                 full_input = f"{input_text}\n\n{context}"
-            if file_paths:
-                paths_str = "\n".join(f"- `{p}`" for p in file_paths)
+            if deduped_file_paths:
+                paths_str = "\n".join(f"- `{p}`" for p in deduped_file_paths)
                 full_input = f"{full_input}\n\n## Referenced Files\n{paths_str}"
 
         payload = {
@@ -182,6 +202,7 @@ class ZoClient:
         stream_interrupted = False
         received_any_events = False
         sse_error_message = ""
+        model_fallback = ""
 
         # Outer retry loop for session pool exhaustion (all sessions busy).
         # Inner loop handles conversation-specific 409s (shorter delays).
@@ -216,6 +237,7 @@ class ZoClient:
                             raise Exception(f"Zo API error {resp.status}: {error_text}")
 
                         conv_id = resp.headers.get("X-Conversation-Id", conversation_id or "")
+                        model_fallback = resp.headers.get("X-Model-Fallback", "")
 
                         if conv_id and on_conv_id:
                             await on_conv_id(conv_id)
@@ -375,6 +397,7 @@ class ZoClient:
             interrupted=stream_interrupted,
             received_events=received_any_events,
             error_message=sse_error_message,
+            model_fallback=model_fallback,
         )
 
     def generate_thread_title_simple(self, user_message: str) -> str:

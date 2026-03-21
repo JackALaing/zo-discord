@@ -520,6 +520,38 @@ async def _require_hermes(ctx: discord.ApplicationContext) -> bool:
     return True
 
 
+async def _defer_then_followup(ctx: discord.ApplicationContext, content: str, **kwargs):
+    """Acknowledge first, then send via follow-up to avoid expired slash interactions."""
+    await ctx.defer(ephemeral=kwargs.get("ephemeral", False))
+    await ctx.followup.send(content, **kwargs)
+
+
+async def _mark_last_exchange_undone(thread: discord.Thread, bot_user: discord.abc.User, removed_count: int) -> None:
+    """Best-effort visual marker for the last undone exchange in Discord history."""
+    if removed_count <= 0:
+        return
+    try:
+        def has_block_reaction(msg) -> bool:
+            for reaction in getattr(msg, "reactions", []) or []:
+                emoji = getattr(reaction, "emoji", None)
+                if emoji == "🚫":
+                    return True
+            return False
+
+        reacted = 0
+        async for msg in thread.history(limit=50):
+            if msg.author == bot_user and reacted < removed_count:
+                if not has_block_reaction(msg):
+                    await msg.add_reaction("🚫")
+                reacted += 1
+            elif msg.author != bot_user and reacted > 0:
+                if not has_block_reaction(msg):
+                    await msg.add_reaction("🚫")
+                break
+    except Exception as e:
+        logger.warning("Failed to add undo reactions: %s", e)
+
+
 def setup_commands(bot):
     """Register all slash commands on the bot."""
 
@@ -655,7 +687,8 @@ def setup_commands(bot):
         )
 
         view = ModelSelectView(bot, global_model, channel_model, channel_id)
-        await ctx.respond(
+        await _defer_then_followup(
+            ctx,
             "\n".join(lines),
             view=view,
             ephemeral=True,
@@ -696,7 +729,8 @@ def setup_commands(bot):
         )
 
         view = PersonaSelectView(bot, global_persona, channel_persona, channel_id)
-        await ctx.respond(
+        await _defer_then_followup(
+            ctx,
             "\n".join(lines),
             view=view,
             ephemeral=True,
@@ -855,7 +889,8 @@ def setup_commands(bot):
             "  - `--file /path/to/file` — Post file contents instead\n"
             '- `zo-discord --conv-id <id> buttons "Prompt?" "Yes:success" "No:danger"` — Send interactive buttons\n'
             "  - `--preset yes_no|approve_reject` — Use a preset\n"
-            '- `zo-discord --conv-id <id> new-thread "Title" "prompt"` — Spawn a new thread',
+            '- `zo-discord --conv-id <id> new-thread "Title" "prompt" --channel-name NAME` — Spawn a new thread\n'
+            "  - `--prompt-file /path/to/file` or piped stdin — Safer prompt input for long or quoted text",
             ephemeral=True,
         )
 
@@ -871,6 +906,8 @@ def setup_commands(bot):
             required=False,
         ) = None,
     ):
+        if not await _require_hermes(ctx):
+            return
         channel = _get_parent_channel(ctx)
         channel_id = str(channel.id)
         ch_config = await get_channel_config(channel_id)
@@ -1000,7 +1037,8 @@ def setup_commands(bot):
             return
         channel = _get_parent_channel(ctx)
         await set_channel_config(str(channel.id), message_mode="queue")
-        await ctx.respond(
+        await _defer_then_followup(
+            ctx,
             "📥 **Queue mode** — messages will be batched and sent after the agent finishes. Use `/interrupt` to switch.",
             ephemeral=True,
         )
@@ -1011,7 +1049,8 @@ def setup_commands(bot):
             return
         channel = _get_parent_channel(ctx)
         await set_channel_config(str(channel.id), message_mode="interrupt")
-        await ctx.respond(
+        await _defer_then_followup(
+            ctx,
             "⚡ **Interrupt mode** — messages will cancel the current turn and be injected immediately. Use `/queue` to switch.",
             ephemeral=True,
         )
@@ -1035,6 +1074,8 @@ def setup_commands(bot):
 
         status_code, body = await _hermes_post("/cancel", {"session_id": session_id})
         if status_code == 200:
+            if isinstance(ctx.channel, discord.Thread) and hasattr(bot, "mark_thread_cancelled"):
+                bot.mark_thread_cancelled(str(ctx.channel.id))
             await ctx.respond("⏹️ Cancelled.", ephemeral=True)
         elif status_code == 404:
             await ctx.respond("Nothing running.", ephemeral=True)
@@ -1058,17 +1099,7 @@ def setup_commands(bot):
         # Try to react to recent bot messages in this thread
         removed_count = body.get("removed_count", 0)
         if isinstance(ctx.channel, discord.Thread) and removed_count > 0:
-            try:
-                reacted = 0
-                async for msg in ctx.channel.history(limit=50):
-                    if msg.author == bot.user and reacted < removed_count:
-                        await msg.add_reaction("🚫")
-                        reacted += 1
-                    elif msg.author != bot.user and reacted > 0:
-                        await msg.add_reaction("🚫")
-                        break
-            except Exception as e:
-                logger.warning("Failed to add undo reactions: %s", e)
+            await _mark_last_exchange_undone(ctx.channel, bot.user, removed_count)
 
         await ctx.respond(
             f"↩️ Last exchange undone. ({body.get('removed_count', 0)} messages removed)",
@@ -1095,6 +1126,13 @@ def setup_commands(bot):
         if status_code != 200:
             await ctx.respond(f"Undo failed: {body.get('error', 'Unknown error')}", ephemeral=True)
             return
+
+        if isinstance(ctx.channel, discord.Thread):
+            await _mark_last_exchange_undone(ctx.channel, bot.user, body.get("removed_count", 0))
+            try:
+                await ctx.channel.send("# Retried Message")
+            except Exception as e:
+                logger.warning("Failed to send retry separator message: %s", e)
 
         await ctx.respond("🔄 Retrying last message...", ephemeral=True)
 
@@ -1217,5 +1255,7 @@ def setup_commands(bot):
             # Update the DB with new session ID
             if isinstance(ctx.channel, discord.Thread):
                 await update_conversation_id(str(ctx.channel.id), new_sid)
+                if hasattr(bot, "_thread_digest_needed"):
+                    bot._thread_digest_needed.add(str(ctx.channel.id))
 
         await ctx.followup.send("\n".join(lines), ephemeral=True)

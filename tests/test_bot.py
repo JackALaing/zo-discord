@@ -38,6 +38,21 @@ def make_bot():
     bot._presaved_attachments = {}
     bot._last_user_messages = {}
     bot._pending_clarify = {}
+    bot._thread_digest_needed = set()
+    bot._cancelled_threads = set()
+
+    def mark_thread_cancelled(thread_id):
+        bot._cancelled_threads.add(str(thread_id))
+
+    def consume_thread_cancelled(thread_id):
+        thread_id = str(thread_id)
+        if thread_id in bot._cancelled_threads:
+            bot._cancelled_threads.discard(thread_id)
+            return True
+        return False
+
+    bot.mark_thread_cancelled = mark_thread_cancelled
+    bot.consume_thread_cancelled = consume_thread_cancelled
     return bot
 
 
@@ -70,11 +85,12 @@ class FakeParentChannel:
 
 
 class FakeThread:
-    def __init__(self, thread_id=789, name="Current Thread", parent=None, pins=None):
+    def __init__(self, thread_id=789, name="Current Thread", parent=None, pins=None, history_messages=None):
         self.id = thread_id
         self.name = name
         self.parent = parent or FakeParentChannel()
         self._pins = pins or []
+        self._history_messages = history_messages or []
         self.sent = []
 
     async def pins(self):
@@ -83,6 +99,13 @@ class FakeThread:
     async def send(self, *args, **kwargs):
         self.sent.append((args, kwargs))
         return SimpleNamespace(id=len(self.sent))
+
+    async def history(self, limit=50, oldest_first=False):
+        messages = list(self._history_messages[:limit])
+        if not oldest_first:
+            messages = list(reversed(messages))
+        for msg in messages:
+            yield msg
 
 
 @pytest.mark.skipif(not HAS_DISCORD, reason="py-cord not installed")
@@ -165,6 +188,35 @@ class TestBotHelpers:
         assert "rename" in context
         assert "files /path/to/file" in context
         assert file_paths == []
+
+    def test_build_thread_context_injects_one_shot_digest_after_compression(self):
+        bot = make_bot()
+        parent = FakeParentChannel(channel_id=222, name="ops")
+        history_messages = [
+            SimpleNamespace(author=FakeAuthor("Jack"), content="penguin"),
+            SimpleNamespace(author=FakeAuthor("Zo", bot=True), content="penguin"),
+            SimpleNamespace(author=FakeAuthor("Jack"), content="volcano"),
+            SimpleNamespace(author=FakeAuthor("Zo", bot=True), content="volcano"),
+            SimpleNamespace(author=FakeAuthor("Jack"), content="whale"),
+            SimpleNamespace(author=FakeAuthor("Zo", bot=True), content="shark"),
+        ]
+        thread = FakeThread(thread_id=333, name="Current Thread", parent=parent, history_messages=history_messages)
+        bot._thread_digest_needed.add(str(thread.id))
+
+        with patch("zo_discord.bot.get_channel_config", AsyncMock(return_value=None)), patch(
+            "zo_discord.bot.get_channel_dir", lambda _name: SimpleNamespace()
+        ):
+            first_context, _ = run(
+                bot.build_thread_context(thread, include_source=False, conv_id="conv-123", backend="hermes")
+            )
+            second_context, _ = run(
+                bot.build_thread_context(thread, include_source=False, conv_id="conv-123", backend="hermes")
+            )
+
+        assert "## Earlier Thread Summary" in first_context
+        assert "- Jack: penguin" in first_context
+        assert "- Zo: volcano" in first_context
+        assert "## Earlier Thread Summary" not in second_context
 
     def test_handle_config_rejects_missing_channel_id(self):
         bot = make_bot()
@@ -252,10 +304,67 @@ class TestBotHelpers:
         assert "best judgement" in response
         assert send_msg.await_count == 2
 
+    def test_clarify_button_view_choice_sets_future(self):
+        from zo_discord.bot import ClarifyButtonView
+
+        class FakeResponse:
+            def __init__(self):
+                self.calls = []
+
+            async def edit_message(self, **kwargs):
+                self.calls.append(kwargs)
+
+        async def exercise():
+            future = asyncio.get_running_loop().create_future()
+            view = ClarifyButtonView(["A", "B"], future)
+            button = next(child for child in view.children if getattr(child, "label", None) == "A")
+            interaction = SimpleNamespace(
+                user=SimpleNamespace(display_name="Jack"),
+                response=FakeResponse(),
+            )
+            await button.callback(interaction)
+            return future, interaction
+
+        future, interaction = run(exercise())
+
+        assert future.done() is True
+        assert future.result() == "A"
+        assert interaction.response.calls == [
+            {"content": "**Jack** selected: **A**", "view": None}
+        ]
+
+    def test_clarify_button_view_other_prompts_for_typed_answer(self):
+        from zo_discord.bot import ClarifyButtonView
+
+        class FakeResponse:
+            def __init__(self):
+                self.calls = []
+
+            async def edit_message(self, **kwargs):
+                self.calls.append(kwargs)
+
+        async def exercise():
+            future = asyncio.get_running_loop().create_future()
+            view = ClarifyButtonView(["A", "B"], future)
+            button = next(child for child in view.children if getattr(child, "label", None) == "Other")
+            interaction = SimpleNamespace(
+                user=SimpleNamespace(display_name="Jack"),
+                response=FakeResponse(),
+            )
+            await button.callback(interaction)
+            return future, interaction
+
+        future, interaction = run(exercise())
+
+        assert future.done() is False
+        assert interaction.response.calls == [
+            {"content": "*Type your answer below:*", "view": None}
+        ]
+
     def test_retry_with_status_gate_waits_for_running_then_retries_when_idle(self):
         bot = make_bot()
         bot.zo.ask_stream = AsyncMock(
-            return_value=SimpleNamespace(output="Recovered response", conv_id="conv-1")
+            return_value=SimpleNamespace(output="Recovered response", conv_id="conv-1", model_fallback="")
         )
 
         statuses = [
@@ -278,6 +387,19 @@ class TestBotHelpers:
         assert output == "Recovered response"
         assert conv_id == "conv-1"
         bot.zo.ask_stream.assert_awaited_once()
+
+    def test_send_model_fallback_notice_skips_duplicate_hermes_byok_notice(self):
+        bot = make_bot()
+
+        with patch("zo_discord.bot.send_suppressed", AsyncMock()) as send_msg:
+            run(
+                bot._send_model_fallback_notice(
+                    FakeThread(),
+                    "Hermes cannot use requested model byok:test; falling back to gpt-5.4.",
+                )
+            )
+
+        send_msg.assert_not_awaited()
 
     def test_retry_with_status_gate_returns_error_if_hermes_unreachable(self):
         bot = make_bot()
@@ -346,6 +468,7 @@ class TestBotHelpers:
                 interrupted=False,
                 received_events=True,
                 error_message="",
+                model_fallback="",
             )
         )
 
@@ -386,3 +509,26 @@ class TestBotHelpers:
 
         bot.zo.ask_stream.assert_awaited_once()
         assert send_msg.await_args_list[0].kwargs["content"].startswith("*Interrupting")
+        assert str(thread.id) in bot._cancelled_threads
+
+    def test_retry_empty_response_skips_retry_for_intentional_cancel(self):
+        bot = make_bot()
+        thread = FakeThread()
+        bot.mark_thread_cancelled(str(thread.id))
+
+        with patch("zo_discord.bot.check_hermes_status", AsyncMock()) as status_mock:
+            response, conv_id = run(
+                bot._retry_empty_response(
+                    str(thread.id),
+                    "conv-1",
+                    thread,
+                    AsyncMock(),
+                    AsyncMock(),
+                    backend="hermes",
+                )
+            )
+
+        assert response is None
+        assert conv_id == "conv-1"
+        status_mock.assert_not_awaited()
+        assert str(thread.id) not in bot._cancelled_threads

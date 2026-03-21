@@ -12,7 +12,7 @@
 #   buttons "Prompt?" "Label:style" ...         — Send interactive buttons
 #   buttons "Prompt?" --preset yes_no           — Send preset buttons (yes_no, approve_reject)
 #   files <path> [message]                      — Send a file attachment to the thread
-#   new-thread <title> <prompt> [--channel-name NAME] — Spawn a new thread
+#   new-thread <title> [<prompt>] (--channel-name NAME|--channel ID) [--prompt-file PATH] — Spawn a new thread
 #
 # Channel targeting: use --channel-name <name> (e.g. "general", "pulse") or --channel <id>
 
@@ -49,7 +49,7 @@ Commands:
   buttons "Prompt?" "Label:style" ...           Send interactive buttons
   buttons "Prompt?" --preset yes_no             Send preset buttons (yes_no, approve_reject)
   files <path> [message]                        Send a file attachment (max 25MB)
-  new-thread <title> <prompt> [--channel-name NAME]  Spawn a new thread
+  new-thread <title> [<prompt>] (--channel-name NAME|--channel ID) [--prompt-file PATH]  Spawn a new thread
 
 Channel targeting: use --channel-name <name> or --channel <id>
 Conv ID: prefer --conv-id <id>; CONVERSATION_ID / ZO_CONVERSATION_ID are fallback only
@@ -200,19 +200,45 @@ print(json.dumps(d))
       -d "$PAYLOAD"
     ;;
   new-thread)
-    TITLE="${1:?Usage: zo-discord new-thread <title> <prompt> [--channel-name NAME]}"
+    TITLE="${1:?Usage: zo-discord new-thread <title> [<prompt>] (--channel-name NAME|--channel ID) [--prompt-file PATH]}"
     shift
-    PROMPT="${1:?Usage: zo-discord new-thread <title> <prompt> [--channel-name NAME]}"
-    shift
+    PROMPT=""
     CHANNEL=""
     CHANNEL_NAME=""
+    PROMPT_FILE=""
+    if [[ $# -gt 0 && ! "$1" =~ ^-- ]]; then
+      PROMPT="$1"
+      shift
+    fi
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --channel-name) CHANNEL_NAME="$2"; shift 2 ;;
         --channel) CHANNEL="$2"; shift 2 ;;
+        --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
       esac
     done
+    if [[ -z "$CHANNEL" && -z "$CHANNEL_NAME" ]]; then
+      echo "Error: --channel-name or --channel is required for new-thread" >&2
+      exit 1
+    fi
+    if [[ -n "$PROMPT" && -n "$PROMPT_FILE" ]]; then
+      echo "Error: provide prompt content using exactly one of: positional <prompt>, --prompt-file PATH, or stdin" >&2
+      exit 1
+    fi
+    if [[ -n "$PROMPT_FILE" ]]; then
+      if [[ ! -f "$PROMPT_FILE" ]]; then
+        echo "Error: prompt file not found: $PROMPT_FILE" >&2
+        exit 1
+      fi
+      PROMPT="$(cat "$PROMPT_FILE")"
+    elif [[ -z "$PROMPT" && ! -t 0 ]]; then
+      PROMPT="$(cat)"
+    fi
+    if [[ -z "$PROMPT" ]]; then
+      echo "Error: provide prompt content as <prompt>, --prompt-file PATH, or piped stdin" >&2
+      exit 1
+    fi
     PAYLOAD=$(python3 -c "
 import json, sys
 d = {'title': sys.argv[1], 'prompt': sys.argv[2]}
