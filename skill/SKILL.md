@@ -147,6 +147,7 @@ Fields:
 - `memory_paths` (array of workspace-relative paths) — each path is passed to Zo as a file to read at the start of every conversation in that channel. zo-discord has no built-in memory system — these paths should point to files maintained by an external memory system.
 - `model` (string) — model ID override for this channel. Overrides the global default.
 - `persona_id` (string) — persona ID override for this channel. Overrides the global default.
+- `backend` (`zo` or `hermes`) — route the channel to Zo or the local Hermes bridge. On Hermes, Discord context and referenced file paths are sent as request-time overlay context rather than merged into the user's message text.
 - `buffer_seconds` (number) — seconds to wait after the last message before processing (0 = disabled, null = use global default). See README for details on typing detection and behavior.
 
 ### Health Check
@@ -218,3 +219,5 @@ Users can customize zo-discord via Discord slash commands — model, persona, me
 9. First message gets full context (source, channel instructions, memory paths, channel topic as fallback, pinned messages, thread naming instructions, tools)
 10. Follow-up messages get compact context (thread name, reply reminder, rename hints, skill link)
 11. Agent replies normally — responses are automatically piped into the Discord thread
+
+When the backend is Hermes, that context is delivered via the `ephemeral_system_prompt` overlay and any referenced files are listed there too. The raw `input` field stays equal to the user's actual message.
