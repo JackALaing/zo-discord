@@ -359,8 +359,20 @@ Toggle with `/queue` and `/interrupt` slash commands.
 The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 
 - **`bot.py`**: `resolve_channel_defaults()` returns four values (`model`, `persona`, `backend`, `hermes_params`). The `hermes_params` dict is passed through to `ask_stream()` via `**kwargs`. The HTTP server exposes `POST /config` for agent-driven config updates (`{"channel_id": "...", "key": "value"}`) and returns `400` for invalid Hermes config values.
-- **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter plus Hermes-specific params (`reasoning_effort`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`) which are included in the API payload when set.
+- **`zo_client.py`**: Imports three functions from `hermes.py` (`get_request_config`, `get_backend_label`, `handle_session_id_change`). The `ask_stream()` method accepts a `backend` parameter plus Hermes-specific params (`reasoning_effort`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`) which are included in the API payload when set. When the backend is Hermes, Discord thread context and referenced file paths are sent via `ephemeral_system_prompt` instead of being prepended to the user message.
 - **`db.py`**: The `channel_config` table stores Hermes params alongside existing fields. `enabled_toolsets` and `disabled_toolsets` are stored as JSON strings and deserialized to lists on read.
+
+### Smoke Test: Verify Hermes Overlay Behavior
+
+Use this after changing Hermes request construction or Discord context formatting.
+
+1. Put one Discord thread on the Hermes backend and make sure both services are healthy:
+   - `curl http://127.0.0.1:8788/health`
+   - `curl http://127.0.0.1:8787/health`
+2. In that Hermes-backed thread, send a message that depends on thread metadata but should not treat it as user intent. Example: ask it to repeat your exact message verbatim, while the thread title and Discord context block contain unrelated instructions.
+3. Confirm the reply reflects only your message, not the injected Discord context. The model should still respect thread metadata operationally, for example by being aware it came from Discord.
+4. Send a message that references a workspace file attached through thread context. Confirm Hermes can use the file path successfully without the path list being echoed back as part of the user's message.
+5. Sanity-check the wire format by tailing `zo-hermes` logs or hitting the endpoint directly in a local repro: the `/ask` JSON should contain `input` with only the user message, and `ephemeral_system_prompt` with the Discord context plus any `## Referenced Files` block.
 
 ### Dependencies
 

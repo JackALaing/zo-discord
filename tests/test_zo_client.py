@@ -164,9 +164,7 @@ class TestAskStream:
         with patch.dict("os.environ", {"DISCORD_ZO_API_KEY": "test-key"}):
             return zc.ZoClient()
 
-    def test_payload_includes_hermes_params_and_file_references(self):
-        import zo_discord.zo_client as zc
-
+    def test_payload_sends_context_via_overlay_for_hermes(self):
         client = self._make_client()
         capture = {}
         response = FakeResponse(
@@ -177,7 +175,7 @@ class TestAskStream:
             ],
         )
 
-        with patch("zo_discord.zo_client.get_request_config", return_value=("http://test/ask", {"Authorization": "Bearer test"})), patch(
+        with patch("zo_discord.zo_client.get_request_config", return_value=("http://127.0.0.1:8788/ask", {"Authorization": "Bearer test"})), patch(
             "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
         ):
             result = asyncio.run(
@@ -205,8 +203,39 @@ class TestAskStream:
         assert payload["skip_context"] is True
         assert payload["enabled_toolsets"] == ["web", "terminal"]
         assert payload["disabled_toolsets"] == ["rl"]
+        assert payload["input"] == "Hi"
+        assert payload["ephemeral_system_prompt"] == "Extra context\n\n## Referenced Files\n- `/home/workspace/a.md`"
+
+    def test_payload_keeps_context_in_input_for_non_hermes(self):
+        client = self._make_client()
+        capture = {}
+        response = FakeResponse(
+            headers={"X-Conversation-Id": "conv-1"},
+            chunks=[
+                b'event: End\n',
+                b'data: {"data": {"output": "hello", "conversation_id": "conv-1"}}\n',
+            ],
+        )
+
+        with patch("zo_discord.zo_client.get_request_config", return_value=("https://api.zo.computer/zo/ask", {"Authorization": "Bearer test"})), patch(
+            "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
+        ):
+            result = asyncio.run(
+                client.ask_stream(
+                    "Hi",
+                    conversation_id="conv-1",
+                    context="Extra context",
+                    file_paths=["/home/workspace/a.md"],
+                    backend="zo",
+                )
+            )
+
+        assert result.output == "hello"
+        payload = capture["json"]
+        assert "Extra context" in payload["input"]
         assert "## Referenced Files" in payload["input"]
         assert "`/home/workspace/a.md`" in payload["input"]
+        assert "ephemeral_system_prompt" not in payload
 
     def test_clarify_event_posts_user_response_back_to_hermes(self):
         client = self._make_client()

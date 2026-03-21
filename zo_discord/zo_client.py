@@ -19,6 +19,18 @@ from zo_discord.hermes import get_request_config, get_backend_label, handle_sess
 logger = logging.getLogger(__name__)
 
 
+def _build_hermes_overlay(context: str = None, file_paths: list[str] = None) -> str | None:
+    sections = []
+    if context:
+        sections.append(context)
+    if file_paths:
+        paths_str = "\n".join(f"- `{p}`" for p in file_paths)
+        sections.append(f"## Referenced Files\n{paths_str}")
+    if not sections:
+        return None
+    return "\n\n".join(sections)
+
+
 @dataclass
 class StreamResult:
     """Result from ask_stream with diagnostic info for retry decisions."""
@@ -118,14 +130,21 @@ class ZoClient:
         Returns:
             StreamResult with output, conv_id, and diagnostic info
         """
-        full_input = input_text
-        if context:
-            full_input = f"{input_text}\n\n{context}"
-        if file_paths:
-            paths_str = "\n".join(f"- `{p}`" for p in file_paths)
-            full_input = f"{full_input}\n\n## Referenced Files\n{paths_str}"
-
         effective_model = model_name or self.model
+        api_url, headers = get_request_config(self.api_key, backend, self.backend)
+        is_hermes_backend = "127.0.0.1:8788/ask" in api_url
+
+        full_input = input_text
+        ephemeral_system_prompt = None
+        if is_hermes_backend:
+            ephemeral_system_prompt = _build_hermes_overlay(context, file_paths)
+        else:
+            if context:
+                full_input = f"{input_text}\n\n{context}"
+            if file_paths:
+                paths_str = "\n".join(f"- `{p}`" for p in file_paths)
+                full_input = f"{full_input}\n\n## Referenced Files\n{paths_str}"
+
         payload = {
             "input": full_input,
             "stream": True,
@@ -137,6 +156,8 @@ class ZoClient:
             payload["conversation_id"] = conversation_id
         if persona_id:
             payload["persona_id"] = persona_id
+        if ephemeral_system_prompt:
+            payload["ephemeral_system_prompt"] = ephemeral_system_prompt
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
         if max_iterations:
@@ -150,7 +171,6 @@ class ZoClient:
         if disabled_toolsets:
             payload["disabled_toolsets"] = disabled_toolsets
 
-        api_url, headers = get_request_config(self.api_key, backend, self.backend)
         backend_label = get_backend_label(backend, self.backend)
 
         hermes_extras = {k: v for k, v in payload.items() if k in ("reasoning_effort", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets")}
