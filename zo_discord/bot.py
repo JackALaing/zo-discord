@@ -1106,10 +1106,20 @@ class ZoDiscordBot(commands.Bot):
                     except (asyncio.TimeoutError, Exception) as e:
                         logger.warning(f"Inflight task didn't finish cleanly after cancel: {e}")
 
+                queued_msgs = []
+                queue = self._message_queues.get(thread_id)
+                if queue:
+                    while not queue.empty():
+                        queued_msgs.append(await queue.get())
+                    self._message_queues.pop(thread_id, None)
+
                 # Clear inflight state so this message processes as a fresh turn
                 self._inflight.pop(thread_id, None)
-                # Discard any queued messages — the interrupt supersedes them
-                self._message_queues.pop(thread_id, None)
+                if queued_msgs:
+                    logger.info(
+                        f"Interrupt mode: preserving {len(queued_msgs)} queued message(s) for thread {thread_id}"
+                    )
+                    self._bundle_messages_into_primary(message, queued_msgs)
                 await send_suppressed(thread, content=f"*Interrupting — processing your new message.*")
                 # Fall through to process this message normally
 
@@ -1633,17 +1643,19 @@ class ZoDiscordBot(commands.Bot):
                 await self.handle_thread_message(queued_msgs[0])
             else:
                 logger.info(f"Processing {len(queued_msgs)} bundled queued messages in thread {thread_id}")
-                # Use the last message as the "primary" (for attachments, reply context, etc.)
-                # and prepend the earlier messages as context
                 primary = queued_msgs[-1]
-                earlier_parts = []
-                for msg in queued_msgs[:-1]:
-                    earlier_parts.append(f"[{msg.author.display_name}]: {msg.content}")
-                bundle_prefix = "[Messages sent while you were working:]\n" + "\n".join(earlier_parts)
-                self._bundled_prefixes[primary.id] = bundle_prefix
+                self._bundle_messages_into_primary(primary, queued_msgs[:-1])
                 await self.handle_thread_message(primary)
         except Exception as e:
             logger.error(f"Error draining message queue for thread {thread_id}: {e}", exc_info=True)
+
+    def _bundle_messages_into_primary(self, primary: discord.Message, earlier_messages: list[discord.Message]) -> None:
+        """Prepend earlier queued messages as context for the primary message."""
+        if not earlier_messages:
+            return
+        earlier_parts = [f"[{msg.author.display_name}]: {msg.content}" for msg in earlier_messages]
+        bundle_prefix = "[Messages sent while you were working:]\n" + "\n".join(earlier_parts)
+        self._bundled_prefixes[primary.id] = bundle_prefix
 
     def _needs_thread_digest(self, previous_conv_id: str, new_conv_id: str) -> bool:
         return bool(previous_conv_id and new_conv_id and previous_conv_id != new_conv_id)

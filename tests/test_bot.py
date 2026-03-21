@@ -511,6 +511,75 @@ class TestBotHelpers:
         assert send_msg.await_args_list[0].kwargs["content"].startswith("*Interrupting")
         assert str(thread.id) in bot._cancelled_threads
 
+    def test_handle_thread_message_interrupt_mode_preserves_queued_messages(self):
+        bot = make_bot()
+        thread = FakeThread()
+        queued = FakeMessage("queued earlier", author=FakeAuthor("Jill"), message_id=2)
+        message = FakeMessage("interrupt me", message_id=3)
+        message.channel = thread
+        inflight_task = SimpleNamespace(done=lambda: True)
+        bot._inflight[str(thread.id)] = {"conv_id": "conv-1", "task": inflight_task}
+        bot._message_queues[str(thread.id)] = asyncio.Queue()
+        run(bot._message_queues[str(thread.id)].put(queued))
+        bot.extract_overrides = lambda text: (None, None, text)
+        bot.resolve_channel_defaults = AsyncMock(return_value=(None, None, "hermes", {}))
+        bot.build_thread_context = AsyncMock(return_value=("", []))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.make_on_clarify = lambda _thread: AsyncMock()
+        bot.typing_loop = AsyncMock()
+
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(
+                output="Handled after interrupt",
+                conv_id="conv-1",
+                interrupted=False,
+                received_events=True,
+                error_message="",
+                model_fallback="",
+            )
+        )
+
+        class FakePostResponse:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        class FakeClientSession:
+            def post(self, *args, **kwargs):
+                return FakePostResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        statuses = [{"state": "running"}, {"state": "idle"}]
+
+        async def fake_status(_session_id):
+            return statuses.pop(0)
+
+        with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
+            "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "interrupt"})
+        ), patch("zo_discord.bot.aiohttp.ClientSession", FakeClientSession), patch(
+            "zo_discord.bot.check_hermes_status", fake_status
+        ), patch("zo_discord.bot.send_suppressed", AsyncMock()), patch(
+            "zo_discord.bot.asyncio.sleep", AsyncMock()
+        ), patch("zo_discord.bot.update_conversation_id", AsyncMock()), patch(
+            "zo_discord.bot.update_activity", AsyncMock()
+        ):
+            run(bot.handle_thread_message(message))
+
+        assert str(thread.id) not in bot._message_queues
+        sent_prompt = bot.zo.ask_stream.await_args.args[0]
+        assert "[Messages sent while you were working:]" in sent_prompt
+        assert "[Jill]: queued earlier" in sent_prompt
+        assert "[Jack]: interrupt me" in sent_prompt
+
     def test_retry_empty_response_skips_retry_for_intentional_cancel(self):
         bot = make_bot()
         thread = FakeThread()
