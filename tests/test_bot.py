@@ -35,6 +35,7 @@ def make_bot():
     bot._inflight = {}
     bot._message_queues = {}
     bot._bundled_prefixes = {}
+    bot._queue_drain_suppressed = set()
     bot._presaved_attachments = {}
     bot._last_user_messages = {}
     bot._pending_clarify = {}
@@ -579,6 +580,20 @@ class TestBotHelpers:
         assert "[Messages sent while you were working:]" in sent_prompt
         assert "[Jill]: queued earlier" in sent_prompt
         assert "[Jack]: interrupt me" in sent_prompt
+
+    def test_drain_queue_skips_during_interrupt_handoff(self):
+        bot = make_bot()
+        thread = FakeThread()
+        queued = FakeMessage("queued earlier", author=FakeAuthor("Jill"), message_id=2)
+        bot._message_queues[str(thread.id)] = asyncio.Queue()
+        run(bot._message_queues[str(thread.id)].put(queued))
+        bot._queue_drain_suppressed.add(str(thread.id))
+        bot.handle_thread_message = AsyncMock()
+
+        run(bot._drain_queue(str(thread.id)))
+
+        bot.handle_thread_message.assert_not_awaited()
+        assert bot._message_queues[str(thread.id)].qsize() == 1
 
     def test_retry_empty_response_skips_retry_for_intentional_cancel(self):
         bot = make_bot()

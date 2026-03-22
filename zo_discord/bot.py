@@ -288,6 +288,7 @@ class ZoDiscordBot(commands.Bot):
         self._inflight = {}  # thread_id -> {"conv_id": str, "task": asyncio.Task}
         self._message_queues = {}  # thread_id -> asyncio.Queue of discord.Message
         self._bundled_prefixes = {}  # message.id -> str, for passing context to handle_thread_message
+        self._queue_drain_suppressed = set()  # thread_id values held during interrupt handoff
         self._presaved_attachments = {}  # message.id -> list[str], pre-saved attachment paths
         self._last_user_messages = {}  # thread_id -> last user message text (for /retry)
         self._pending_clarify = {}  # thread_id -> asyncio.Future for clarify response
@@ -1070,58 +1071,61 @@ class ZoDiscordBot(commands.Bot):
                 logger.info(f"Interrupt mode: cancelling inflight for thread {thread_id}")
                 session_id = inflight.get("conv_id")
                 inflight_task = inflight.get("task")
+                self._queue_drain_suppressed.add(thread_id)
+                try:
+                    # Cancel the Hermes session
+                    if session_id:
+                        try:
+                            async with aiohttp.ClientSession() as http_session:
+                                async with http_session.post(
+                                    "http://127.0.0.1:8788/cancel",
+                                    json={"session_id": session_id},
+                                    timeout=aiohttp.ClientTimeout(total=10),
+                                ) as resp:
+                                    cancel_status = resp.status
+                                    logger.info(f"Cancel response for session {session_id}: {cancel_status}")
+                                    if cancel_status == 200:
+                                        self.mark_thread_cancelled(thread_id)
+                        except Exception as e:
+                            logger.error(f"Failed to cancel session {session_id}: {e}")
 
-                # Cancel the Hermes session
-                if session_id:
-                    try:
-                        async with aiohttp.ClientSession() as http_session:
-                            async with http_session.post(
-                                "http://127.0.0.1:8788/cancel",
-                                json={"session_id": session_id},
-                                timeout=aiohttp.ClientTimeout(total=10),
-                            ) as resp:
-                                cancel_status = resp.status
-                                logger.info(f"Cancel response for session {session_id}: {cancel_status}")
-                                if cancel_status == 200:
-                                    self.mark_thread_cancelled(thread_id)
-                    except Exception as e:
-                        logger.error(f"Failed to cancel session {session_id}: {e}")
+                    # Wait for the agent to become idle (status-gated)
+                    # Poll /status to confirm the agent actually stopped, rather
+                    # than relying on a blind timeout.
+                    if session_id:
+                        for poll in range(20):  # up to 30s (20 * 1.5s)
+                            status = await check_hermes_status(session_id)
+                            if status is None or status.get("state") != "running":
+                                break
+                            await asyncio.sleep(1.5)
+                        else:
+                            logger.warning(f"Agent still running after cancel polls for session {session_id}")
 
-                # Wait for the agent to become idle (status-gated)
-                # Poll /status to confirm the agent actually stopped, rather
-                # than relying on a blind timeout.
-                if session_id:
-                    for poll in range(20):  # up to 30s (20 * 1.5s)
-                        status = await check_hermes_status(session_id)
-                        if status is None or status.get("state") != "running":
-                            break
-                        await asyncio.sleep(1.5)
-                    else:
-                        logger.warning(f"Agent still running after cancel polls for session {session_id}")
+                    # Also wait for the inflight asyncio task to finish
+                    if inflight_task and not inflight_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(inflight_task), timeout=5)
+                        except (asyncio.TimeoutError, Exception) as e:
+                            logger.warning(f"Inflight task didn't finish cleanly after cancel: {e}")
 
-                # Also wait for the inflight asyncio task to finish
-                if inflight_task and not inflight_task.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(inflight_task), timeout=5)
-                    except (asyncio.TimeoutError, Exception) as e:
-                        logger.warning(f"Inflight task didn't finish cleanly after cancel: {e}")
+                    queued_msgs = []
+                    queue = self._message_queues.get(thread_id)
+                    if queue:
+                        while not queue.empty():
+                            queued_msgs.append(await queue.get())
+                        self._message_queues.pop(thread_id, None)
 
-                queued_msgs = []
-                queue = self._message_queues.get(thread_id)
-                if queue:
-                    while not queue.empty():
-                        queued_msgs.append(await queue.get())
-                    self._message_queues.pop(thread_id, None)
-
-                # Clear inflight state so this message processes as a fresh turn
-                self._inflight.pop(thread_id, None)
-                if queued_msgs:
-                    logger.info(
-                        f"Interrupt mode: preserving {len(queued_msgs)} queued message(s) for thread {thread_id}"
-                    )
-                    self._bundle_messages_into_primary(message, queued_msgs)
-                await send_suppressed(thread, content=f"*Interrupting — processing your new message.*")
-                # Fall through to process this message normally
+                    # Clear inflight state so this message processes as a fresh turn
+                    self._inflight.pop(thread_id, None)
+                    if queued_msgs:
+                        logger.info(
+                            f"Interrupt mode: preserving {len(queued_msgs)} queued message(s) for thread {thread_id}"
+                        )
+                        self._bundle_messages_into_primary(message, queued_msgs)
+                    await send_suppressed(thread, content=f"*Interrupting — processing your new message.*")
+                    # Fall through to process this message normally
+                finally:
+                    self._queue_drain_suppressed.discard(thread_id)
 
             else:
                 # Queue mode (default behavior)
@@ -1629,6 +1633,10 @@ class ZoDiscordBot(commands.Bot):
         "do X" then "also Y" → agent does X+Y).
         """
         try:
+            if thread_id in self._queue_drain_suppressed:
+                logger.info(f"Skipping queue drain during interrupt handoff for thread {thread_id}")
+                return
+
             queue = self._message_queues.get(thread_id)
             if not queue or queue.empty():
                 return
