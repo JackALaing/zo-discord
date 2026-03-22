@@ -14,12 +14,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncGenerator, Callable, Awaitable
 
-from zo_discord.hermes import get_request_config, get_backend_label, handle_session_id_change
+from zo_discord.hermes import (
+    get_backend_label,
+    get_request_config,
+    handle_session_id_change,
+    is_hermes,
+)
 
 logger = logging.getLogger(__name__)
+HERMES_PAYLOAD_KEYS = (
+    "reasoning_effort",
+    "max_iterations",
+    "skip_memory",
+    "skip_context",
+    "enabled_toolsets",
+    "disabled_toolsets",
+)
 
 
-def _dedupe_file_paths(file_paths: list[str] = None) -> list[str]:
+def _dedupe_file_paths(file_paths: list[str] | None = None) -> list[str]:
     if not file_paths:
         return []
     deduped = []
@@ -36,7 +49,7 @@ def _dedupe_file_paths(file_paths: list[str] = None) -> list[str]:
     return deduped
 
 
-def _build_hermes_overlay(context: str = None, file_paths: list[str] = None) -> str | None:
+def _build_hermes_overlay(context: str | None = None, file_paths: list[str] | None = None) -> str | None:
     sections = []
     if context:
         sections.append(context)
@@ -47,6 +60,24 @@ def _build_hermes_overlay(context: str = None, file_paths: list[str] = None) -> 
     if not sections:
         return None
     return "\n\n".join(sections)
+
+
+def _build_input_with_context(
+    input_text: str,
+    context: str | None = None,
+    file_paths: list[str] | None = None,
+) -> str:
+    full_input = input_text
+    if context:
+        full_input = f"{full_input}\n\n{context}"
+    if file_paths:
+        paths_str = "\n".join(f"- `{p}`" for p in file_paths)
+        full_input = f"{full_input}\n\n## Referenced Files\n{paths_str}"
+    return full_input
+
+
+def _collect_hermes_payload_extras(payload: dict) -> dict:
+    return {key: payload[key] for key in HERMES_PAYLOAD_KEYS if key in payload}
 
 
 @dataclass
@@ -151,19 +182,14 @@ class ZoClient:
         """
         effective_model = model_name or self.model
         api_url, headers = get_request_config(self.api_key, backend, self.backend)
-        is_hermes_backend = "127.0.0.1:8788/ask" in api_url
-
+        use_hermes_backend = is_hermes(backend, self.backend)
+        deduped_file_paths = _dedupe_file_paths(file_paths)
         full_input = input_text
         ephemeral_system_prompt = None
-        deduped_file_paths = _dedupe_file_paths(file_paths)
-        if is_hermes_backend:
+        if use_hermes_backend:
             ephemeral_system_prompt = _build_hermes_overlay(context, deduped_file_paths)
         else:
-            if context:
-                full_input = f"{input_text}\n\n{context}"
-            if deduped_file_paths:
-                paths_str = "\n".join(f"- `{p}`" for p in deduped_file_paths)
-                full_input = f"{full_input}\n\n## Referenced Files\n{paths_str}"
+            full_input = _build_input_with_context(input_text, context, deduped_file_paths)
 
         payload = {
             "input": full_input,
@@ -193,8 +219,15 @@ class ZoClient:
 
         backend_label = get_backend_label(backend, self.backend)
 
-        hermes_extras = {k: v for k, v in payload.items() if k in ("reasoning_effort", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets")}
-        logger.info(f"Sending to {backend_label} API - model_name: {payload.get('model_name')}, persona_id: {payload.get('persona_id')}, conv_id: {payload.get('conversation_id', 'new')}" + (f", hermes_params: {hermes_extras}" if hermes_extras else ""))
+        hermes_extras = _collect_hermes_payload_extras(payload)
+        logger.info(
+            "Sending to %s API - model_name: %s, persona_id: %s, conv_id: %s%s",
+            backend_label,
+            payload.get("model_name"),
+            payload.get("persona_id"),
+            payload.get("conversation_id", "new"),
+            f", hermes_params: {hermes_extras}" if hermes_extras else "",
+        )
 
         timeout = aiohttp.ClientTimeout(total=1800)
         conv_id = conversation_id or ""

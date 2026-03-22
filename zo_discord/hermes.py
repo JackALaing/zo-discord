@@ -4,8 +4,8 @@ Hermes backend support for zo-discord.
 Encapsulates all Hermes-specific configuration and request/response
 handling so the core zo-discord modules stay backend-agnostic.
 
-zo-hermes service: http://127.0.0.1:8788 (Zo service svc_bInt4_9RgFI)
-See Knowledge/zo/Hermes/zo-hermes-skill-draft.md for full documentation.
+zo-hermes service: http://127.0.0.1:8788
+See the zo-hermes README for setup and troubleshooting details.
 """
 
 import aiohttp
@@ -18,39 +18,50 @@ HERMES_URL = "http://127.0.0.1:8788"
 HERMES_DEFAULT_MODEL = "gpt-5.4"
 
 
+async def _hermes_get_json(
+    path: str,
+    *,
+    params: dict | None = None,
+    timeout_seconds: int,
+) -> tuple[int | None, dict | None]:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"{HERMES_URL}{path}",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+            ) as resp:
+                if resp.status != 200:
+                    return resp.status, None
+                return resp.status, await resp.json()
+    except Exception:
+        return None, None
+
+
 async def check_hermes_status(session_id: str) -> dict | None:
     """Check zo-hermes agent status for a session.
 
     Returns dict with 'state' ('running'|'idle'), 'iterations_used', etc.
     Returns None if hermes is unreachable or session not found.
     """
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{HERMES_URL}/status",
-                params={"session_id": session_id},
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                logger.warning(f"Hermes /status returned {resp.status} for session {session_id}")
-                return None
-    except Exception as e:
-        logger.warning(f"Hermes /status unreachable for session {session_id}: {e}")
-        return None
+    status, body = await _hermes_get_json(
+        "/status",
+        params={"session_id": session_id},
+        timeout_seconds=5,
+    )
+    if body is not None:
+        return body
+    if status is not None:
+        logger.warning("Hermes /status returned %s for session %s", status, session_id)
+    else:
+        logger.warning("Hermes /status unreachable for session %s", session_id)
+    return None
 
 
 async def check_hermes_health() -> bool:
     """Basic liveness check — is zo-hermes responding?"""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{HERMES_URL}/health",
-                timeout=aiohttp.ClientTimeout(total=2),
-            ) as resp:
-                return resp.status == 200
-    except Exception:
-        return False
+    status, _body = await _hermes_get_json("/health", timeout_seconds=2)
+    return status == 200
 
 
 def is_hermes(backend: str | None, default_backend: str = "zo") -> bool:
@@ -120,4 +131,3 @@ def handle_session_id_change(event_data: dict, current_conv_id: str) -> str | No
         logger.info("Session ID changed (compression): %s -> %s", current_conv_id, new_conv)
         return new_conv
     return None
-

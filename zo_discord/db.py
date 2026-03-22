@@ -3,9 +3,9 @@ Thread-Conversation mapping database.
 Maps Discord thread IDs to Zo conversation IDs for session persistence.
 """
 
+import json
 import aiosqlite
 import os
-import json
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +15,36 @@ DB_PATH = PROJECT_ROOT / "data" / "threads.db"
 VALID_REASONING_LEVELS = {"off", "low", "medium", "high"}
 VALID_BACKENDS = {"zo", "hermes"}
 VALID_MESSAGE_MODES = {"queue", "interrupt"}
+JSON_LIST_FIELDS = ("memory_paths", "enabled_toolsets", "disabled_toolsets")
+CHANNEL_CONFIG_FIELDS = (
+    "instructions",
+    "memory_paths",
+    "persona_id",
+    "model",
+    "buffer_seconds",
+    "backend",
+    "reasoning",
+    "max_iterations",
+    "skip_memory",
+    "skip_context",
+    "enabled_toolsets",
+    "disabled_toolsets",
+    "message_mode",
+)
+CHANNEL_CONFIG_MIGRATIONS = (
+    "ALTER TABLE thread_mappings ADD COLUMN status TEXT DEFAULT NULL",
+    "ALTER TABLE thread_mappings ADD COLUMN watched INTEGER DEFAULT 1",
+    "ALTER TABLE channel_config ADD COLUMN model TEXT DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN buffer_seconds REAL DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN backend TEXT DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN reasoning TEXT DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN max_iterations INTEGER DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN skip_memory BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE channel_config ADD COLUMN skip_context BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE channel_config ADD COLUMN enabled_toolsets TEXT DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN disabled_toolsets TEXT DEFAULT NULL",
+    "ALTER TABLE channel_config ADD COLUMN message_mode TEXT DEFAULT 'queue'",
+)
 
 
 def _parse_json_list(value, field_name: str):
@@ -37,23 +67,42 @@ def _parse_json_list(value, field_name: str):
     raise ValueError(f"{field_name} must be a list or JSON-encoded list")
 
 
+def _validate_choice(value, field_name: str, valid_values: set[str], *, allow_none: bool = True) -> None:
+    if value is None and allow_none:
+        return
+    if value not in valid_values:
+        raise ValueError(f"{field_name} must be one of {sorted(valid_values)}")
+
+
+def _validate_bool(value, field_name: str) -> None:
+    if value is not None and not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+
+
+def _serialize_json_list_fields(values: dict) -> dict:
+    serialized = dict(values)
+    for field_name in JSON_LIST_FIELDS:
+        if field_name in serialized and isinstance(serialized[field_name], list):
+            serialized[field_name] = json.dumps(serialized[field_name])
+    return serialized
+
+
 def _validate_channel_config_kwargs(kwargs: dict) -> dict:
     normalized = dict(kwargs)
 
     if "reasoning" in normalized:
-        value = normalized["reasoning"]
-        if value is not None and value not in VALID_REASONING_LEVELS:
-            raise ValueError(f"reasoning must be one of {sorted(VALID_REASONING_LEVELS)}")
+        _validate_choice(normalized["reasoning"], "reasoning", VALID_REASONING_LEVELS)
 
     if "backend" in normalized:
-        value = normalized["backend"]
-        if value is not None and value not in VALID_BACKENDS:
-            raise ValueError(f"backend must be one of {sorted(VALID_BACKENDS)}")
+        _validate_choice(normalized["backend"], "backend", VALID_BACKENDS)
 
     if "message_mode" in normalized:
-        value = normalized["message_mode"]
-        if value not in VALID_MESSAGE_MODES:
-            raise ValueError(f"message_mode must be one of {sorted(VALID_MESSAGE_MODES)}")
+        _validate_choice(
+            normalized["message_mode"],
+            "message_mode",
+            VALID_MESSAGE_MODES,
+            allow_none=False,
+        )
 
     if "max_iterations" in normalized:
         value = normalized["max_iterations"]
@@ -62,20 +111,24 @@ def _validate_channel_config_kwargs(kwargs: dict) -> dict:
                 raise ValueError("max_iterations must be an integer >= 1")
 
     if "skip_memory" in normalized:
-        value = normalized["skip_memory"]
-        if value is not None and not isinstance(value, bool):
-            raise ValueError("skip_memory must be a boolean")
+        _validate_bool(normalized["skip_memory"], "skip_memory")
 
     if "skip_context" in normalized:
-        value = normalized["skip_context"]
-        if value is not None and not isinstance(value, bool):
-            raise ValueError("skip_context must be a boolean")
+        _validate_bool(normalized["skip_context"], "skip_context")
 
-    for field_name in ("memory_paths", "enabled_toolsets", "disabled_toolsets"):
+    for field_name in JSON_LIST_FIELDS:
         if field_name in normalized:
             normalized[field_name] = _parse_json_list(normalized[field_name], field_name)
 
     return normalized
+
+
+async def _apply_migrations(db) -> None:
+    for statement in CHANNEL_CONFIG_MIGRATIONS:
+        try:
+            await db.execute(statement)
+        except Exception:
+            pass
 
 
 async def init_db():
@@ -115,54 +168,7 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_channel_config
             ON channel_config(channel_id)
         """)
-        try:
-            await db.execute("ALTER TABLE thread_mappings ADD COLUMN status TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE thread_mappings ADD COLUMN watched INTEGER DEFAULT 1")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN model TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN buffer_seconds REAL DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN backend TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN reasoning TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN max_iterations INTEGER DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN skip_memory BOOLEAN DEFAULT FALSE")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN skip_context BOOLEAN DEFAULT FALSE")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN enabled_toolsets TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN disabled_toolsets TEXT DEFAULT NULL")
-        except Exception:
-            pass
-        try:
-            await db.execute("ALTER TABLE channel_config ADD COLUMN message_mode TEXT DEFAULT 'queue'")
-        except Exception:
-            pass
+        await _apply_migrations(db)
         await db.commit()
 
 
@@ -276,7 +282,6 @@ async def get_channel_config(channel_id: str) -> dict | None:
         if not row:
             return None
         config = dict(row)
-        import json
         config["memory_paths"] = json.loads(config.get("memory_paths") or "[]")
         config["enabled_toolsets"] = json.loads(config.get("enabled_toolsets") or "null")
         config["disabled_toolsets"] = json.loads(config.get("disabled_toolsets") or "null")
@@ -285,23 +290,14 @@ async def get_channel_config(channel_id: str) -> dict | None:
 
 async def set_channel_config(channel_id: str, **kwargs) -> None:
     now = datetime.utcnow().isoformat()
-    kwargs = _validate_channel_config_kwargs(kwargs)
+    kwargs = _serialize_json_list_fields(_validate_channel_config_kwargs(kwargs))
     existing = await get_channel_config(channel_id)
-    
-    if "memory_paths" in kwargs and isinstance(kwargs["memory_paths"], list):
-        kwargs["memory_paths"] = json.dumps(kwargs["memory_paths"])
-    if "enabled_toolsets" in kwargs and isinstance(kwargs["enabled_toolsets"], list):
-        kwargs["enabled_toolsets"] = json.dumps(kwargs["enabled_toolsets"])
-    if "disabled_toolsets" in kwargs and isinstance(kwargs["disabled_toolsets"], list):
-        kwargs["disabled_toolsets"] = json.dumps(kwargs["disabled_toolsets"])
-    
+
     async with aiosqlite.connect(DB_PATH) as db:
         if existing:
             sets = []
             vals = []
-            for key in ("instructions", "memory_paths", "persona_id", "model", "buffer_seconds", "backend",
-                        "reasoning", "max_iterations", "skip_memory", "skip_context", "enabled_toolsets", "disabled_toolsets",
-                        "message_mode"):
+            for key in CHANNEL_CONFIG_FIELDS:
                 if key in kwargs:
                     sets.append(f"{key} = ?")
                     vals.append(kwargs[key])

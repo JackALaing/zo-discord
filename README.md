@@ -366,8 +366,8 @@ The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 
 ### Dependencies
 
-- `zo-hermes` Zo service (`svc_bInt4_9RgFI`) must be running on port 8788
-- See `Knowledge/zo/Hermes/zo-hermes-skill-draft.md` for zo-hermes setup and troubleshooting
+- `zo-hermes` must be running on port 8788
+- See the `zo-hermes` repo README for setup and troubleshooting details
 
 ## License
 
