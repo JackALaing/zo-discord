@@ -138,6 +138,20 @@ class TestCommands:
         assert "**Session Management**" not in content
         assert "`/reasoning`" not in content
 
+    def test_help_uses_global_hermes_backend_when_channel_has_no_override(self):
+        commands = register_commands()
+        ctx = FakeCtx(SimpleNamespace(id=10, name="general"))
+
+        with patch("zo_discord.commands.get_channel_config", AsyncMock(return_value=None)), patch(
+            "zo_discord.commands.load_config", return_value={"backend": "hermes"}
+        ):
+            run(commands["help"](ctx))
+
+        content = ctx.responses[-1]["content"]
+        assert "Backend: Hermes" in content
+        assert "**Session Management**" in content
+        assert "`/reasoning`" in content
+
     def test_help_shows_hermes_sections_in_hermes_threads(self):
         commands = register_commands()
         parent = SimpleNamespace(id=10, name="general")

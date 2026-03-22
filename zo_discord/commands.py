@@ -75,13 +75,13 @@ async def _get_channel_backend(ctx: discord.ApplicationContext) -> str | None:
 def _is_hermes_ctx(backend: str | None) -> bool:
     """Check if the channel backend is Hermes."""
     config = load_config()
-    return is_hermes(backend, config.get("default_backend", "zo"))
+    return is_hermes(backend, config.get("backend", "zo"))
 
 
 def _backend_label(backend: str | None) -> str:
     """Human-readable backend name."""
     config = load_config()
-    return "Hermes" if is_hermes(backend, config.get("default_backend", "zo")) else "Zo"
+    return "Hermes" if is_hermes(backend, config.get("backend", "zo")) else "Zo"
 
 
 def _save_config_key(key: str, value):
