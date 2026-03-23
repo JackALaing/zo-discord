@@ -1166,11 +1166,10 @@ class ZoDiscordBot(commands.Bot):
         channel_hermes_params = {}
         if parent_channel_id:
             channel_model, channel_persona, channel_backend, channel_hermes_params = await self.resolve_channel_defaults(parent_channel_id)
-            if not conv_id:
-                if not effective_model:
-                    effective_model = channel_model
-                if not effective_persona:
-                    effective_persona = channel_persona
+            if not effective_model:
+                effective_model = channel_model
+            if not effective_persona:
+                effective_persona = channel_persona
         if not effective_persona:
             config = load_config()
             effective_persona = config.get("default_persona")

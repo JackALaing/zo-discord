@@ -581,6 +581,40 @@ class TestBotHelpers:
         assert "[Jill]: queued earlier" in sent_prompt
         assert "[Jack]: interrupt me" in sent_prompt
 
+    def test_handle_thread_message_uses_channel_model_for_existing_conversation(self):
+        bot = make_bot()
+        thread = FakeThread(parent=FakeParentChannel(channel_id=222, name="zo"))
+        message = FakeMessage("follow up")
+        message.channel = thread
+        bot.extract_overrides = lambda text: (None, None, text)
+        bot.resolve_channel_defaults = AsyncMock(
+            return_value=("byok:test-model", "per_123", "zo", {})
+        )
+        bot.build_thread_context = AsyncMock(return_value=("", []))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.typing_loop = AsyncMock()
+        bot._send_hermes_model_fallback_notice = AsyncMock()
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(
+                output="Follow-up handled",
+                conv_id="conv-1",
+                interrupted=False,
+                received_events=True,
+                error_message="",
+                model_fallback="",
+            )
+        )
+
+        with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
+            "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})
+        ), patch("zo_discord.bot.update_activity", AsyncMock()), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ):
+            run(bot.handle_thread_message(message))
+
+        assert bot.zo.ask_stream.await_args.kwargs["model_name"] == "byok:test-model"
+        assert bot.zo.ask_stream.await_args.kwargs["persona_id"] == "per_123"
+
     def test_drain_queue_skips_during_interrupt_handoff(self):
         bot = make_bot()
         thread = FakeThread()
