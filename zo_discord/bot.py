@@ -33,6 +33,7 @@ from zo_discord.hermes import (
     check_hermes_status,
     check_hermes_health,
     get_model_fallback_notice,
+    get_persona_ignored_notice,
     is_hermes,
 )
 from zo_discord.commands import setup_commands
@@ -390,6 +391,15 @@ class ZoDiscordBot(commands.Bot):
             await send_suppressed(channel, content=notice)
         except Exception as e:
             logger.warning(f"Failed to send Hermes model fallback notice: {e}")
+
+    async def _send_hermes_persona_ignored_notice(self, channel, persona_id: str | None, backend: str | None):
+        notice = get_persona_ignored_notice(persona_id, backend, self.zo.backend)
+        if not notice:
+            return
+        try:
+            await send_suppressed(channel, content=notice)
+        except Exception as e:
+            logger.warning(f"Failed to send Hermes persona notice: {e}")
 
     async def on_ready(self):
         if not self._initialized:
@@ -822,6 +832,7 @@ class ZoDiscordBot(commands.Bot):
 
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
             await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
+            await self._send_hermes_persona_ignored_notice(thread, effective_persona, channel_backend)
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,
@@ -969,6 +980,7 @@ class ZoDiscordBot(commands.Bot):
 
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
             await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
+            await self._send_hermes_persona_ignored_notice(thread, effective_persona, channel_backend)
             result = await self.zo.ask_stream(
                 user_text,
                 context=context or None,

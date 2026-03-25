@@ -112,6 +112,18 @@ def get_model_fallback_notice(requested_model: str | None, backend: str | None, 
     )
 
 
+def get_persona_ignored_notice(persona_id: str | None, backend: str | None, default_backend: str = "zo") -> str | None:
+    """Explain when Hermes must ignore a Zo persona override."""
+    if not is_hermes(backend, default_backend):
+        return None
+    if not persona_id:
+        return None
+    return (
+        f"*Hermes can't use Zo persona IDs (`{persona_id}`), so this conversation is continuing "
+        "with the current Hermes personality/prompt setup.*"
+    )
+
+
 def handle_session_id_change(event_data: dict, current_conv_id: str) -> str | None:
     """
     Check if Hermes changed the session ID (due to context compression).
