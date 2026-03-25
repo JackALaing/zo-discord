@@ -150,6 +150,7 @@ class ZoClient:
         self,
         input_text: str,
         conversation_id: str = None,
+        honcho_session_key: str = None,
         context: str = None,
         file_paths: list[str] = None,
         on_thinking: Callable[[str], Awaitable[None]] = None,
@@ -171,6 +172,7 @@ class ZoClient:
         Args:
             input_text: The user's message
             conversation_id: Optional existing conversation ID
+            honcho_session_key: Stable Honcho session key for Hermes-backed threads
             context: Optional context string appended after the user message
             file_paths: Optional list of file paths referenced in the context
             on_thinking: Async callback for thinking previews (receives text to post)
@@ -200,6 +202,8 @@ class ZoClient:
             payload["model_name"] = effective_model
         if conversation_id:
             payload["conversation_id"] = conversation_id
+        if use_hermes_backend and honcho_session_key:
+            payload["honcho_session_key"] = honcho_session_key
         if persona_id:
             payload["persona_id"] = persona_id
         if ephemeral_system_prompt:

@@ -203,6 +203,7 @@ class TestAskStream:
                 client.ask_stream(
                     "Hi",
                     conversation_id="conv-1",
+                    honcho_session_key="discord-thread-123",
                     context="Extra context",
                     file_paths=["/home/workspace/Skills/zo-discord", "/home/workspace/Services/zo-discord/skill"],
                     backend="hermes",
@@ -219,6 +220,7 @@ class TestAskStream:
         assert result.model_fallback.startswith("Hermes cannot use requested model")
         payload = capture["json"]
         assert payload["conversation_id"] == "conv-1"
+        assert payload["honcho_session_key"] == "discord-thread-123"
         assert payload["reasoning_effort"] == "high"
         assert payload["max_iterations"] == 7
         assert payload["skip_memory"] is True
@@ -246,6 +248,7 @@ class TestAskStream:
                 client.ask_stream(
                     "Hi",
                     conversation_id="conv-1",
+                    honcho_session_key="discord-thread-123",
                     context="Extra context",
                     file_paths=["/home/workspace/a.md"],
                     backend="zo",
@@ -258,6 +261,7 @@ class TestAskStream:
         assert "## Referenced Files" in payload["input"]
         assert "`/home/workspace/a.md`" in payload["input"]
         assert "ephemeral_system_prompt" not in payload
+        assert "honcho_session_key" not in payload
 
     def test_clarify_event_posts_user_response_back_to_hermes(self):
         client = self._make_client()

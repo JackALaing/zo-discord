@@ -34,6 +34,7 @@ CHANNEL_CONFIG_FIELDS = (
 CHANNEL_CONFIG_MIGRATIONS = (
     "ALTER TABLE thread_mappings ADD COLUMN status TEXT DEFAULT NULL",
     "ALTER TABLE thread_mappings ADD COLUMN watched INTEGER DEFAULT 1",
+    "ALTER TABLE thread_mappings ADD COLUMN honcho_session_key TEXT DEFAULT NULL",
     "ALTER TABLE channel_config ADD COLUMN model TEXT DEFAULT NULL",
     "ALTER TABLE channel_config ADD COLUMN buffer_seconds REAL DEFAULT NULL",
     "ALTER TABLE channel_config ADD COLUMN backend TEXT DEFAULT NULL",
@@ -144,7 +145,8 @@ async def init_db():
                 guild_id TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_activity TEXT NOT NULL,
-                thread_name TEXT
+                thread_name TEXT,
+                honcho_session_key TEXT DEFAULT NULL
             )
         """)
         await db.execute("""
@@ -177,17 +179,18 @@ async def save_mapping(
     conversation_id: str,
     channel_id: str,
     guild_id: str,
-    thread_name: str = None
+    thread_name: str = None,
+    honcho_session_key: str | None = None,
 ):
     """Save a thread-to-conversation mapping."""
     now = datetime.utcnow().isoformat()
-    
+
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT OR REPLACE INTO thread_mappings 
-            (thread_id, conversation_id, channel_id, guild_id, created_at, last_activity, thread_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (thread_id, conversation_id, channel_id, guild_id, now, now, thread_name))
+            (thread_id, conversation_id, channel_id, guild_id, created_at, last_activity, thread_name, honcho_session_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (thread_id, conversation_id, channel_id, guild_id, now, now, thread_name, honcho_session_key))
         await db.commit()
 
 
@@ -232,6 +235,48 @@ async def update_conversation_id(thread_id: str, conversation_id: str):
             (conversation_id, thread_id)
         )
         await db.commit()
+
+
+async def get_honcho_session_key(thread_id: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT honcho_session_key FROM thread_mappings WHERE thread_id = ?",
+            (thread_id,)
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def update_honcho_session_key(thread_id: str, honcho_session_key: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE thread_mappings SET honcho_session_key = ? WHERE thread_id = ?",
+            (honcho_session_key, thread_id)
+        )
+        await db.commit()
+
+
+async def resolve_honcho_session_key(thread_id: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT honcho_session_key, conversation_id FROM thread_mappings WHERE thread_id = ?",
+            (thread_id,)
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+
+        honcho_session_key, conversation_id = row
+        if honcho_session_key:
+            return honcho_session_key
+
+        backfilled_key = conversation_id if conversation_id else f"discord-thread-{thread_id}"
+        await db.execute(
+            "UPDATE thread_mappings SET honcho_session_key = ? WHERE thread_id = ?",
+            (backfilled_key, thread_id)
+        )
+        await db.commit()
+        return backfilled_key
 
 
 async def get_active_threads(guild_id: str = None, limit: int = 50) -> list[dict]:

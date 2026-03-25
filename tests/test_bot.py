@@ -41,6 +41,7 @@ def make_bot():
     bot._pending_clarify = {}
     bot._thread_digest_needed = set()
     bot._cancelled_threads = set()
+    bot.queued_renames = {}
 
     def mark_thread_cancelled(thread_id):
         bot._cancelled_threads.add(str(thread_id))
@@ -606,6 +607,7 @@ class TestBotHelpers:
         )
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
+            "zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value="stable-key")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})
         ), patch("zo_discord.bot.update_activity", AsyncMock()), patch(
             "zo_discord.bot.send_suppressed", AsyncMock()
@@ -614,6 +616,124 @@ class TestBotHelpers:
 
         assert bot.zo.ask_stream.await_args.kwargs["model_name"] == "byok:test-model"
         assert bot.zo.ask_stream.await_args.kwargs["persona_id"] == "per_123"
+        assert bot.zo.ask_stream.await_args.kwargs["honcho_session_key"] == "stable-key"
+
+    def test_handle_notify_stores_explicit_honcho_session_key(self):
+        bot = make_bot()
+
+        class NotifyThread:
+            def __init__(self):
+                self.id = 789
+                self.guild = SimpleNamespace(id=999)
+
+        class StarterMessage:
+            async def create_thread(self, name):
+                return NotifyThread()
+
+        class NotifyChannel:
+            id = 456
+            guild = SimpleNamespace(id=999)
+
+            async def send(self, _content):
+                return StarterMessage()
+
+        request = make_mocked_request("POST", "/notify")
+        request._post = None
+        request.json = AsyncMock(
+            return_value={
+                "channel_name": "hermes",
+                "title": "Thread Title",
+                "content": "",
+                "conversation_id": "conv-1",
+                "honcho_session_key": "stable-key",
+            }
+        )
+        bot.resolve_channel_by_name = lambda _name: NotifyChannel()
+
+        with patch("zo_discord.bot.get_mapping_by_conversation", AsyncMock(return_value=None)), patch(
+            "zo_discord.bot.save_mapping", AsyncMock()
+        ) as save_mapping:
+            response = run(bot.handle_notify(request))
+
+        assert response.status == 200
+        assert save_mapping.await_args.kwargs["honcho_session_key"] == "stable-key"
+
+    def test_handle_notify_falls_back_to_conversation_id_for_honcho_session_key(self):
+        bot = make_bot()
+
+        class NotifyThread:
+            def __init__(self):
+                self.id = 789
+                self.guild = SimpleNamespace(id=999)
+
+        class StarterMessage:
+            async def create_thread(self, name):
+                return NotifyThread()
+
+        class NotifyChannel:
+            id = 456
+            guild = SimpleNamespace(id=999)
+
+            async def send(self, _content):
+                return StarterMessage()
+
+        request = make_mocked_request("POST", "/notify")
+        request._post = None
+        request.json = AsyncMock(
+            return_value={
+                "channel_name": "hermes",
+                "title": "Thread Title",
+                "content": "",
+                "conversation_id": "conv-1",
+            }
+        )
+        bot.resolve_channel_by_name = lambda _name: NotifyChannel()
+
+        with patch("zo_discord.bot.get_mapping_by_conversation", AsyncMock(return_value=None)), patch(
+            "zo_discord.bot.save_mapping", AsyncMock()
+        ) as save_mapping:
+            response = run(bot.handle_notify(request))
+
+        assert response.status == 200
+        assert save_mapping.await_args.kwargs["honcho_session_key"] == "conv-1"
+
+    def test_handle_channel_message_seeds_thread_honcho_session_key(self):
+        bot = make_bot()
+        channel = FakeParentChannel(channel_id=222, name="hermes")
+        thread = FakeThread(thread_id=333, name="Thread Title", parent=channel)
+        message = FakeMessage("kick off")
+        message.channel = channel
+        message.guild = SimpleNamespace(id=999)
+        message.create_thread = AsyncMock(return_value=thread)
+        bot.extract_overrides = lambda text: (None, None, text)
+        bot.resolve_channel_defaults = AsyncMock(return_value=(None, None, "hermes", {}))
+        bot.build_channel_context = AsyncMock(return_value=("", []))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.make_on_clarify = lambda _thread: AsyncMock()
+        bot.typing_loop = AsyncMock()
+        bot._send_hermes_model_fallback_notice = AsyncMock()
+        bot._send_hermes_persona_ignored_notice = AsyncMock()
+        bot.zo.generate_thread_title_simple = lambda _text: "Thread Title"
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(
+                output="Started",
+                conv_id="sess-1",
+                interrupted=False,
+                received_events=True,
+                error_message="",
+                model_fallback="",
+            )
+        )
+
+        with patch("zo_discord.bot.save_mapping", AsyncMock()) as save_mapping, patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ), patch("zo_discord.bot.update_thread_name", AsyncMock()), patch(
+            "zo_discord.bot.update_conversation_id", AsyncMock()
+        ):
+            run(bot.handle_channel_message(message))
+
+        assert save_mapping.await_args.kwargs["honcho_session_key"] == "discord-thread-333"
+        assert bot.zo.ask_stream.await_args.kwargs["honcho_session_key"] == "discord-thread-333"
 
     def test_drain_queue_skips_during_interrupt_handoff(self):
         bot = make_bot()
