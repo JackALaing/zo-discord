@@ -325,7 +325,7 @@ zo-discord/
 
 ## Hermes Backend
 
-zo-discord supports routing conversations to [Hermes Agent](https://hermes-agent.nousresearch.com/) instead of the Zo API. Hermes runs locally via `zo-hermes` (a FastAPI bridge on port 8788) and provides cancel/interrupt support, context compression, clarify flow, and Hermes-native tool execution inside Discord threads.
+zo-discord supports routing conversations to [Hermes Agent](https://hermes-agent.nousresearch.com/) instead of the Zo API. Hermes runs locally via [`zo-hermes`](https://github.com/JackALaing/zo-hermes) (a FastAPI bridge on port 8788) and provides cancel/interrupt support, context compression, clarify flow, and Hermes-native tool execution inside Discord threads.
 
 This integration is specific to `zo-discord`. It does not change how native Zo chat channels work, and it does not make native Zo agents run on Hermes.
 
@@ -372,9 +372,9 @@ The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 
 ### Dependencies
 
-- `zo-hermes` must be running on port 8788
+- [`zo-hermes`](https://github.com/JackALaing/zo-hermes) must be running on port 8788
 - Hermes support in this repo is for `zo-discord` threads and for `zo-dispatcher` notifications that land in Discord threads
-- See the `zo-hermes` repo README for setup and troubleshooting details
+- See the [`zo-hermes` README](https://github.com/JackALaing/zo-hermes/blob/main/README.md) for setup and troubleshooting details
 
 ## License
 
