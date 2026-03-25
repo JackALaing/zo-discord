@@ -389,6 +389,11 @@ class TestBotHelpers:
         assert output == "Recovered response"
         assert conv_id == "conv-1"
         bot.zo.ask_stream.assert_awaited_once()
+        sent_prompt = bot.zo.ask_stream.await_args.args[0]
+        sent_context = bot.zo.ask_stream.await_args.kwargs["context"]
+        assert "Original user message for this turn" in sent_prompt
+        assert "continue" in sent_prompt
+        assert "transport-recovery resend" in sent_context
 
     def test_send_model_fallback_notice_skips_duplicate_hermes_byok_notice(self):
         bot = make_bot()
@@ -418,6 +423,39 @@ class TestBotHelpers:
         assert "zo-hermes is not responding" in output
         assert conv_id == "conv-1"
 
+    def test_retry_with_status_gate_rechecks_queue_before_recovery_send(self):
+        bot = make_bot()
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(output="Recovered response", conv_id="conv-1", model_fallback="")
+        )
+        bot._message_queues["thread-1"] = asyncio.Queue()
+
+        statuses = [
+            {"state": "running", "iterations_used": 1, "iterations_max": 10},
+            {"state": "idle", "iterations_used": 1, "iterations_max": 10},
+        ]
+
+        async def fake_status(_conv_id):
+            if len(statuses) == 1:
+                bot._message_queues["thread-1"].put_nowait(FakeMessage("follow up", author=FakeAuthor("Jill"), message_id=2))
+            return statuses.pop(0)
+
+        with patch("zo_discord.bot.check_hermes_status", fake_status), patch(
+            "zo_discord.bot.asyncio.sleep", AsyncMock()
+        ), patch("zo_discord.bot.update_conversation_id", AsyncMock()):
+            output, conv_id = run(
+                bot._retry_with_status_gate(
+                    "conv-1", "thread-1", "original message", AsyncMock(), AsyncMock(), "hermes"
+                )
+            )
+
+        assert output == "Recovered response"
+        assert conv_id == "conv-1"
+        sent_prompt = bot.zo.ask_stream.await_args.args[0]
+        assert "original message" in sent_prompt
+        assert "Queued user messages received while the previous turn was in progress" in sent_prompt
+        assert "[Jill]: follow up" in sent_prompt
+
     def test_drain_queue_bundles_multiple_messages(self):
         bot = make_bot()
         bot._message_queues["thread-1"] = asyncio.Queue()
@@ -442,7 +480,9 @@ class TestBotHelpers:
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})
-        ), patch("zo_discord.bot.send_suppressed", AsyncMock()) as send_msg:
+        ), patch("zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value=None)), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ) as send_msg:
             run(bot.handle_thread_message(message))
 
         assert str(thread.id) in bot._message_queues
@@ -500,13 +540,13 @@ class TestBotHelpers:
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "interrupt"})
-        ), patch("zo_discord.bot.aiohttp.ClientSession", FakeClientSession), patch(
-            "zo_discord.bot.check_hermes_status", fake_status
-        ), patch("zo_discord.bot.send_suppressed", AsyncMock()) as send_msg, patch(
-            "zo_discord.bot.asyncio.sleep", AsyncMock()
-        ), patch("zo_discord.bot.update_conversation_id", AsyncMock()), patch(
-            "zo_discord.bot.update_activity", AsyncMock()
-        ):
+        ), patch("zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value=None)), patch(
+            "zo_discord.bot.aiohttp.ClientSession", FakeClientSession
+        ), patch("zo_discord.bot.check_hermes_status", fake_status), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ) as send_msg, patch("zo_discord.bot.asyncio.sleep", AsyncMock()), patch(
+            "zo_discord.bot.update_conversation_id", AsyncMock()
+        ), patch("zo_discord.bot.update_activity", AsyncMock()):
             run(bot.handle_thread_message(message))
 
         bot.zo.ask_stream.assert_awaited_once()
@@ -567,13 +607,13 @@ class TestBotHelpers:
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "interrupt"})
-        ), patch("zo_discord.bot.aiohttp.ClientSession", FakeClientSession), patch(
-            "zo_discord.bot.check_hermes_status", fake_status
-        ), patch("zo_discord.bot.send_suppressed", AsyncMock()), patch(
-            "zo_discord.bot.asyncio.sleep", AsyncMock()
-        ), patch("zo_discord.bot.update_conversation_id", AsyncMock()), patch(
-            "zo_discord.bot.update_activity", AsyncMock()
-        ):
+        ), patch("zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value=None)), patch(
+            "zo_discord.bot.aiohttp.ClientSession", FakeClientSession
+        ), patch("zo_discord.bot.check_hermes_status", fake_status), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ), patch("zo_discord.bot.asyncio.sleep", AsyncMock()), patch(
+            "zo_discord.bot.update_conversation_id", AsyncMock()
+        ), patch("zo_discord.bot.update_activity", AsyncMock()):
             run(bot.handle_thread_message(message))
 
         assert str(thread.id) not in bot._message_queues
