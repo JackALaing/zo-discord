@@ -146,7 +146,7 @@ Fields:
 - `instructions` (text) — injected into every thread's context as "Channel Instructions". Replaces the channel topic as context when set.
 - `memory_paths` (array of workspace-relative paths) — each path is passed to Zo as a file to read at the start of every conversation in that channel. zo-discord has no built-in memory system — these paths should point to files maintained by an external memory system.
 - `model` (string) — model ID override for this channel. Overrides the global default.
-- `persona_id` (string) — persona ID override for this channel. Overrides the global default.
+- `persona_id` (string) — persona ID override for this channel. Overrides the global default on the Zo backend. Hermes requests still accept this field for compatibility, but `zo-hermes` currently ignores it.
 - `backend` (`zo` or `hermes`) — route the channel to Zo or the local Hermes bridge. On Hermes, Discord context and referenced file paths are sent as request-time overlay context rather than merged into the user's message text.
 - `buffer_seconds` (number) — seconds to wait after the last message before processing (0 = disabled, null = use global default). See README for details on typing detection and behavior.
 
@@ -223,3 +223,23 @@ Users can customize zo-discord via Discord slash commands — model, persona, me
 11. Agent replies normally — responses are automatically piped into the Discord thread
 
 When the backend is Hermes, that context is delivered via the `ephemeral_system_prompt` overlay and any referenced files are listed there too. The raw `input` field stays equal to the user's actual message.
+
+## Hermes Backend
+
+`zo-discord` can route a channel to the local `zo-hermes` bridge by setting `backend: hermes` in channel config.
+
+That unlocks:
+
+- Hermes-backed Discord threads
+- per-channel Hermes controls: `reasoning`, `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`
+- Hermes session commands: `/stop`, `/undo`, `/retry`, `/status`, `/usage`, `/compress`
+- shared Zo-style request fields such as `persona_id` still flow through the client path, but `zo-hermes` currently ignores `persona_id` because Hermes does not have a matching Zo persona mechanism
+- queue vs interrupt message modes
+- clarify questions posted back into Discord and resumed through `POST /clarify-response`
+
+Scope boundaries:
+
+- This applies only to `zo-discord` channels configured for Hermes.
+- It does not change native Zo communication channels.
+- It does not make native Zo agents run on Hermes.
+- For non-Discord sources, integrate directly with `zo-hermes` or use Hermes' own messaging gateways.

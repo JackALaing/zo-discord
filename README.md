@@ -21,15 +21,15 @@ A Discord bot for [Zo Computer](https://zo.computer) that makes Discord a first-
 
 ### Configuration
 - **Models** — Set a default model globally or per-channel with `/model`. Define aliases to make model IDs easier to remember, and prefix a new conversation with `/alias` (e.g. `/opus`) to override the model for that thread.
-- **Personas** — Set a default persona globally or per-channel with `/persona`. Define aliases and prefix a new conversation with `@alias` (e.g. `@pirate`) to override for that thread.
+- **Personas** — Set a default persona globally or per-channel with `/persona`. Define aliases and prefix a new conversation with `@alias` (e.g. `@pirate`) to override for that thread. On the Zo backend this changes the Zo persona. On the Hermes backend, `zo-discord` still passes the value for compatibility, but `zo-hermes` currently ignores `persona_id`.
 - **Channel instructions & memory** — Set custom instructions and memory file paths per-channel — they're injected into every conversation. Channel topic and pinned messages also provide context.
-- **Hermes channel config** — Per-channel overrides for Hermes-specific settings: `reasoning` (off/low/medium/high), `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`. Set via SQLite or the `/config` HTTP endpoint.
+- **Hermes channel config** — Per-channel overrides for Hermes-specific settings: `reasoning` (off/low/medium/high), `max_iterations`, `skip_memory`, `skip_context`, `enabled_toolsets`, `disabled_toolsets`. Set via SQLite or the `/config` HTTP endpoint. Requires Hermes backend via zo-hermes.
 - **Allowed users** — Restrict bot access to specific Discord users, or allow all users. Manage with `/allowed-users`.
-- **Session management** — `/stop` (cancel current turn), `/undo` (remove last exchange), `/retry` (undo + re-send), `/status` (session state), `/usage` (token counts), `/compress` (compress context). Requires Hermes backend.
+- **Session management** — `/stop` (cancel current turn), `/undo` (remove last exchange), `/retry` (undo + re-send), `/status` (session state), `/usage` (token counts), `/compress` (compress context). Requires Hermes backend via zo-hermes.
 - **Slash commands** — `/help`, `/model`, `/persona`, `/buffer`, `/thinking`, `/auto-archive`, `/instructions`, `/memory`, `/allowed-users`, `/tips`, `/link`, `/cli`, `/reasoning`, `/tools`, `/max-iterations`, `/skip-memory`, `/skip-context`, `/compression-threshold`, `/queue`, `/interrupt`, `/stop`, `/undo`, `/retry`, `/status`, `/usage`, `/compress`
 
 ### Scheduled Agents
-- **Notifications** — Scheduled Zo agents can post results to new Discord threads with session continuity, so you can reply and continue the conversation. See `skill/scheduled-agent-example.md`.
+- **Notifications** — `zo-dispatcher` agents can post results to new Discord threads with session continuity, so you can reply and continue the conversation. See `skill/scheduled-agent-example.md`.
 - **Interactive buttons** — Agents can present choices via buttons; the user's selection is injected back into the conversation.
 - **File attachments** — Agents can send files back via the HTTP API.
 - **Rich embeds** — Agents can post structured embeds with fields, colors, and footers.
@@ -135,10 +135,10 @@ ln -sf "$(pwd)/skill/scripts/discord-cli.sh" /usr/local/bin/zo-discord
 
 ### 8. Install the Skill
 
-Copy the skill to your Zo skills directory so Zo knows how to use the Discord API:
+Expose the repo skill in your Zo skills directory with a symlink so the installed skill stays in sync with the service repo:
 
 ```bash
-cp -r skill/ /home/workspace/Skills/zo-discord/
+ln -sfn "$(pwd)/skill" /home/workspace/Skills/zo-discord
 ```
 
 ## How It Works
@@ -148,7 +148,7 @@ cp -r skill/ /home/workspace/Skills/zo-discord/
 3. Bot creates a thread with Zo's response
 4. Thread-to-conversation mapping is stored in SQLite
 5. Follow-up messages in the thread continue the same Zo session
-6. Scheduled Zo agents can use the CLI (prefer `--conv-id`) to spawn new Discord threads linked to their active session
+6. `zo-dispatcher` agents can use the CLI (prefer `--conv-id`) to spawn new Discord threads linked to their active session
 
 ## CLI Reference
 
@@ -170,7 +170,7 @@ See `skill/SKILL.md` for full HTTP API documentation.
 
 ## Agent Notifications
 
-Scheduled Zo agents can spawn new Discord threads linked to their active session, so the user can reply and continue the same conversation with full context of the agent's work. See `skill/scheduled-agent-example.md` for a complete example.
+`zo-dispatcher` agents can spawn new Discord threads linked to their active session, so the user can reply and continue the same conversation with full context of the agent's work. See `skill/scheduled-agent-example.md` for a complete example.
 
 The key pattern: the agent does its work, builds up conversation context, then posts results to a new Discord thread via `zo-discord notify`. The thread is linked to the agent's Zo session, so replies continue seamlessly.
 
@@ -259,6 +259,8 @@ Then use them in Discord:
 
 The `/persona` slash command shows all configured aliases. To find your persona IDs, start a conversation with the persona active, then ask Zo to set the alias — Zo will find the persona ID more easily when it's the one in use.
 
+This override is meaningful on the Zo backend. In Hermes-backed channels, `zo-discord` still sends `persona_id` for compatibility, but `zo-hermes` currently ignores it.
+
 ## Thread Management
 
 - **Auto-archive prevention**: When enabled, a background routine bumps thread timers every 6 hours and auto-archives are reversed in real-time. Toggle with `/auto-archive`.
@@ -323,7 +325,9 @@ zo-discord/
 
 ## Hermes Backend
 
-zo-discord supports routing conversations to [Hermes Agent](https://hermes-agent.nousresearch.com/) instead of the Zo API. Hermes runs locally via `zo-hermes` (a FastAPI bridge on port 8788) and provides cancel/interrupt support, context compression, and native tool use.
+zo-discord supports routing conversations to [Hermes Agent](https://hermes-agent.nousresearch.com/) instead of the Zo API. Hermes runs locally via `zo-hermes` (a FastAPI bridge on port 8788) and provides cancel/interrupt support, context compression, clarify flow, and Hermes-native tool execution inside Discord threads.
+
+This integration is specific to `zo-discord`. It does not change how native Zo chat channels work, and it does not make native Zo agents run on Hermes.
 
 ### Configuration
 
@@ -356,6 +360,8 @@ The `message_mode` channel config controls what happens when a user sends a mess
 
 Toggle with `/queue` and `/interrupt` slash commands.
 
+*Note: Interrupt only works with a Hermes backend.*
+
 ### Changes to Core Modules
 
 The Hermes integration touches `bot.py` and `zo_client.py` minimally:
@@ -367,6 +373,7 @@ The Hermes integration touches `bot.py` and `zo_client.py` minimally:
 ### Dependencies
 
 - `zo-hermes` must be running on port 8788
+- Hermes support in this repo is for `zo-discord` threads and for `zo-dispatcher` notifications that land in Discord threads
 - See the `zo-hermes` repo README for setup and troubleshooting details
 
 ## License
