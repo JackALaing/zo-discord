@@ -328,3 +328,115 @@ class TestAskStream:
 
         assert result.interrupted is True
         assert result.error_message == "boom"
+        assert result.turn_status == "error"
+
+    def test_completed_streamed_only_uses_bridge_terminal_output_without_local_synthesis(self):
+        client = self._make_client()
+        capture = {}
+        response = FakeResponse(
+            headers={"X-Conversation-Id": "conv-2"},
+            chunks=[
+                b'event: PartStartEvent\n',
+                b'data: {"part":{"part_kind":"text","content":"from streamed text"}}\n',
+                b'event: End\n',
+                b'data: {"data":{"output":"from bridge output","conversation_id":"conv-2","result":{"turn_status":"completed_streamed_only","output_source":"streamed_text","output_present":true,"hermes_final_response_present":false,"completed":true,"partial":false,"failed":false,"interrupted":false,"error":null}}}\n',
+            ],
+        )
+
+        with patch("zo_discord.zo_client.get_request_config", return_value=("http://test/ask", {"Authorization": "Bearer test"})), patch(
+            "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
+        ):
+            result = asyncio.run(client.ask_stream("Hi", backend="hermes"))
+
+        assert result.output == "from bridge output"
+        assert result.turn_status == "completed_streamed_only"
+        assert result.terminal_result["output_source"] == "streamed_text"
+
+    def test_old_bridge_without_result_keeps_streamed_text_compatibility_fallback(self):
+        client = self._make_client()
+        capture = {}
+        response = FakeResponse(
+            headers={"X-Conversation-Id": "conv-3"},
+            chunks=[
+                b'event: PartStartEvent\n',
+                b'data: {"part":{"part_kind":"text","content":"old bridge streamed text"}}\n',
+                b'event: End\n',
+                b'data: {"data":{"output":"","conversation_id":"conv-3"}}\n',
+            ],
+        )
+
+        with patch("zo_discord.zo_client.get_request_config", return_value=("http://test/ask", {"Authorization": "Bearer test"})), patch(
+            "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
+        ):
+            result = asyncio.run(client.ask_stream("Hi", backend="hermes"))
+
+        assert result.output == "old bridge streamed text"
+        assert result.turn_status == "completed_streamed_only"
+        assert result.terminal_result is None
+
+    def test_old_bridge_partial_stream_then_sse_error_does_not_promote_streamed_text(self):
+        client = self._make_client()
+        capture = {}
+        response = FakeResponse(
+            headers={"X-Conversation-Id": "conv-4"},
+            chunks=[
+                b'event: PartStartEvent\n',
+                b'data: {"part":{"part_kind":"text","content":"partial streamed text"}}\n',
+                b'event: SSEErrorEvent\n',
+                b'data: {"message":"boom"}\n',
+            ],
+        )
+
+        with patch("zo_discord.zo_client.get_request_config", return_value=("http://test/ask", {"Authorization": "Bearer test"})), patch(
+            "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
+        ):
+            result = asyncio.run(client.ask_stream("Hi", backend="hermes"))
+
+        assert result.output == ""
+        assert result.interrupted is True
+        assert result.error_message == "boom"
+        assert result.turn_status == "error"
+        assert result.terminal_result is None
+
+    def test_old_bridge_partial_stream_without_end_does_not_promote_streamed_text(self):
+        client = self._make_client()
+        capture = {}
+        response = FakeResponse(
+            headers={"X-Conversation-Id": "conv-5"},
+            chunks=[
+                b'event: PartStartEvent\n',
+                b'data: {"part":{"part_kind":"text","content":"partial streamed text"}}\n',
+            ],
+        )
+
+        with patch("zo_discord.zo_client.get_request_config", return_value=("http://test/ask", {"Authorization": "Bearer test"})), patch(
+            "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
+        ):
+            result = asyncio.run(client.ask_stream("Hi", backend="hermes"))
+
+        assert result.output == ""
+        assert result.interrupted is True
+        assert result.error_message == ""
+        assert result.turn_status == ""
+        assert result.terminal_result is None
+
+    def test_end_result_preserves_conversation_rollover(self):
+        client = self._make_client()
+        capture = {}
+        on_conv_id = AsyncMock()
+        response = FakeResponse(
+            headers={"X-Conversation-Id": "conv-1"},
+            chunks=[
+                b'event: End\n',
+                b'data: {"data":{"output":"done","conversation_id":"conv-2","result":{"turn_status":"completed","output_source":"final_response","output_present":true,"hermes_final_response_present":true,"completed":true,"partial":false,"failed":false,"interrupted":false,"error":null}}}\n',
+            ],
+        )
+
+        with patch("zo_discord.zo_client.get_request_config", return_value=("http://test/ask", {"Authorization": "Bearer test"})), patch(
+            "zo_discord.zo_client.aiohttp.ClientSession", lambda timeout=None: FakeSession(response, capture)
+        ):
+            result = asyncio.run(client.ask_stream("Hi", conversation_id="conv-1", backend="hermes", on_conv_id=on_conv_id))
+
+        assert result.conv_id == "conv-2"
+        assert result.turn_status == "completed"
+        assert on_conv_id.await_args_list[-1].args == ("conv-2",)

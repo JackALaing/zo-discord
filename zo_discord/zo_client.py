@@ -89,6 +89,14 @@ class StreamResult:
     received_events: bool  # got any SSE events at all
     error_message: str = ""  # SSEErrorEvent message if stream errored
     model_fallback: str = ""
+    turn_status: str = ""
+    terminal_result: dict | None = None
+
+
+def _normalize_terminal_result(result: dict | None) -> dict | None:
+    if not isinstance(result, dict):
+        return None
+    return result
 
 from zo_discord import PROJECT_ROOT
 
@@ -240,6 +248,9 @@ class ZoClient:
         received_any_events = False
         sse_error_message = ""
         model_fallback = ""
+        terminal_result = None
+        turn_status = ""
+        stream_ended_cleanly = False
 
         # Outer retry loop for session pool exhaustion (all sessions busy).
         # Inner loop handles conversation-specific 409s (shorter delays).
@@ -389,17 +400,22 @@ class ZoClient:
                                         error_msg = event.get("message", "")
                                         logger.warning(f"SSE error event for conv {conv_id}: {error_msg}")
                                         sse_error_message = error_msg
+                                        turn_status = event.get("turn_status", "error") or "error"
                                         stream_interrupted = True
                                         break
 
                                     elif current_event_type == "End":
                                         end_data = event.get("data", {})
                                         final_output = end_data.get("output", "")
+                                        terminal_result = _normalize_terminal_result(end_data.get("result"))
+                                        if terminal_result:
+                                            turn_status = terminal_result.get("turn_status", "") or ""
                                         new_conv = handle_session_id_change(end_data, conv_id)
                                         if new_conv:
                                             conv_id = new_conv
                                             if on_conv_id:
                                                 await on_conv_id(conv_id)
+                                        stream_ended_cleanly = True
                                         stream_done = True
                                         break
                                 if stream_done:
@@ -421,12 +437,12 @@ class ZoClient:
 
             break  # success or non-pool error — exit outer loop
 
-        # Fallback: if End event had empty output but we accumulated streamed text,
-        # use the streamed text. This can happen when zo-hermes streams deltas but
-        # the final_response field is empty.
-        if not final_output and text_buffer.strip():
+        # Old-bridge compatibility only: if End had no result envelope and no
+        # output, preserve the historical streamed-text synthesis.
+        if stream_ended_cleanly and not stream_interrupted and not terminal_result and not final_output and text_buffer.strip():
             logger.info(f"Using streamed text_buffer as output for conv {conv_id} (End event output was empty)")
             final_output = text_buffer
+            turn_status = "completed_streamed_only"
 
         return StreamResult(
             output=final_output,
@@ -435,6 +451,8 @@ class ZoClient:
             received_events=received_any_events,
             error_message=sse_error_message,
             model_fallback=model_fallback,
+            turn_status=turn_status,
+            terminal_result=terminal_result,
         )
 
     def generate_thread_title_simple(self, user_message: str) -> str:

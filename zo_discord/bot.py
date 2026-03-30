@@ -181,6 +181,18 @@ class ButtonCallbackView(ui.View):
                             _, _, btn_backend, btn_hermes_params = await self.bot.resolve_channel_defaults(str(thread.parent.id))
                         on_clarify = self.bot.make_on_clarify(thread) if btn_backend == "hermes" else None
                         context, file_paths = await self.bot.build_thread_context(thread, include_source=False, conv_id=conv_id, backend=btn_backend or "")
+                        self.bot._cache_empty_response_request_envelope(
+                            self.thread_id,
+                            conversation_id=conv_id,
+                            honcho_session_key=honcho_session_key,
+                            context=context or None,
+                            file_paths=file_paths or None,
+                            on_thinking=on_thinking,
+                            on_conv_id=on_conv_id,
+                            on_clarify=on_clarify,
+                            backend=btn_backend,
+                            **btn_hermes_params,
+                        )
                         result = await self.bot.zo.ask_stream(
                             choice_msg,
                             conversation_id=conv_id,
@@ -202,7 +214,7 @@ class ButtonCallbackView(ui.View):
                         if not response or not response.strip():
                             logger.warning(f"Empty response for button callback conv {conv_id} (interrupted={result.interrupted})")
                             response, new_conv_id = await self.bot._retry_empty_response(
-                                self.thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
+                                self.thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id, result,
                                 backend=btn_backend,
                                 honcho_session_key=honcho_session_key,
                             )
@@ -213,8 +225,9 @@ class ButtonCallbackView(ui.View):
                         chunks = self.bot.zo.chunk_response(response)
                         chunks = [c for c in chunks if c.strip()]
                         if not chunks:
+                            retry_attempts = self.bot._consume_empty_response_retry_attempts(self.thread_id)
                             logger.error(f"All retries exhausted for button callback conv {conv_id}")
-                            chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id or conv_id}`\n\nSend another message to try again."]
+                            chunks = [self.bot._build_empty_response_exhausted_message(new_conv_id or conv_id, retry_attempts)]
                         await self.bot._send_model_fallback_notice(thread, result.model_fallback)
                         for chunk in chunks:
                             await send_suppressed(thread, content=chunk)
@@ -297,6 +310,8 @@ class ZoDiscordBot(commands.Bot):
         self._queue_drain_suppressed = set()  # thread_id values held during interrupt handoff
         self._presaved_attachments = {}  # message.id -> list[str], pre-saved attachment paths
         self._last_user_messages = {}  # thread_id -> last user message text (for /retry)
+        self._empty_response_request_envelopes = {}  # thread_id -> ask_stream kwargs for empty-response recovery
+        self._empty_response_retry_attempts = {}  # thread_id -> count of actual recovery resend attempts
         self._pending_clarify = {}  # thread_id -> asyncio.Future for clarify response
         self._thread_digest_needed = set()  # thread_id values needing one-shot history injection after compression
         self._cancelled_threads = set()  # thread_id values intentionally cancelled via /stop or interrupt
@@ -841,6 +856,19 @@ class ZoDiscordBot(commands.Bot):
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
             await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
             await self._send_hermes_persona_ignored_notice(thread, effective_persona, channel_backend)
+            self._cache_empty_response_request_envelope(
+                thread_id,
+                honcho_session_key=honcho_session_key,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                model_name=effective_model,
+                persona_id=effective_persona,
+                backend=channel_backend,
+                **channel_hermes_params,
+            )
             result = await self.zo.ask_stream(
                 user_text,
                 honcho_session_key=honcho_session_key,
@@ -868,25 +896,23 @@ class ZoDiscordBot(commands.Bot):
                     await update_thread_name(thread_id, rename[:100])
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
-                if result.error_message:
-                    response = f"\u26a0\ufe0f **Request failed.**\n\n`{result.error_message[:200]}`\n\nSend another message to try again."
-                else:
-                    response, conv_id = await self._retry_empty_response(
-                        thread_id, conv_id, thread, on_thinking, on_conv_id,
-                        backend=channel_backend,
-                        honcho_session_key=honcho_session_key,
-                    )
-                    if response is None:
-                        logger.info(f"Cancelled turn in thread {thread_id}; not sending retry or fallback")
-                        return
+                logger.warning(f"Empty response for conv {conv_id} (status={result.turn_status or 'unknown'}, interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
+                response, conv_id = await self._retry_empty_response(
+                    thread_id, conv_id, thread, on_thinking, on_conv_id, result,
+                    backend=channel_backend,
+                    honcho_session_key=honcho_session_key,
+                )
+                if response is None:
+                    logger.info(f"Cancelled turn in thread {thread_id}; not sending retry or fallback")
+                    return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
             if not chunks:
+                retry_attempts = self._consume_empty_response_retry_attempts(thread_id)
                 # All retries exhausted — show fallback
                 logger.error(f"All retries exhausted for conv {conv_id}")
-                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\nSend another message to try again."]
+                chunks = [self._build_empty_response_exhausted_message(conv_id, retry_attempts)]
             await self._send_model_fallback_notice(thread, result.model_fallback)
             for chunk in chunks:
                 await send_suppressed(thread, content=chunk)
@@ -993,6 +1019,19 @@ class ZoDiscordBot(commands.Bot):
             on_clarify = self.make_on_clarify(thread) if channel_backend == "hermes" else None
             await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
             await self._send_hermes_persona_ignored_notice(thread, effective_persona, channel_backend)
+            self._cache_empty_response_request_envelope(
+                thread_id,
+                honcho_session_key=honcho_session_key,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                model_name=effective_model,
+                persona_id=effective_persona,
+                backend=channel_backend,
+                **channel_hermes_params,
+            )
             result = await self.zo.ask_stream(
                 user_text,
                 honcho_session_key=honcho_session_key,
@@ -1018,24 +1057,22 @@ class ZoDiscordBot(commands.Bot):
                     await update_thread_name(thread_id, rename[:100])
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for conv {conv_id} (interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
-                if result.error_message:
-                    response = f"\u26a0\ufe0f **Request failed.**\n\n`{result.error_message[:200]}`\n\nSend another message to try again."
-                else:
-                    response, conv_id = await self._retry_empty_response(
-                        thread_id, conv_id, thread, on_thinking, on_conv_id,
-                        backend=channel_backend,
-                        honcho_session_key=honcho_session_key,
-                    )
-                    if response is None:
-                        logger.info(f"Cancelled batched turn in thread {thread_id}; not sending retry or fallback")
-                        return
+                logger.warning(f"Empty response for conv {conv_id} (status={result.turn_status or 'unknown'}, interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
+                response, conv_id = await self._retry_empty_response(
+                    thread_id, conv_id, thread, on_thinking, on_conv_id, result,
+                    backend=channel_backend,
+                    honcho_session_key=honcho_session_key,
+                )
+                if response is None:
+                    logger.info(f"Cancelled batched turn in thread {thread_id}; not sending retry or fallback")
+                    return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
             if not chunks:
+                retry_attempts = self._consume_empty_response_retry_attempts(thread_id)
                 logger.error(f"All retries exhausted for conv {conv_id}")
-                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\nSend another message to try again."]
+                chunks = [self._build_empty_response_exhausted_message(conv_id, retry_attempts)]
             await self._send_model_fallback_notice(thread, result.model_fallback)
             for chunk in chunks:
                 await send_suppressed(thread, content=chunk)
@@ -1274,6 +1311,20 @@ class ZoDiscordBot(commands.Bot):
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
         try:
             await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
+            self._cache_empty_response_request_envelope(
+                thread_id,
+                conversation_id=conv_id if conv_id else None,
+                honcho_session_key=honcho_session_key,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                model_name=effective_model,
+                persona_id=effective_persona,
+                backend=channel_backend,
+                **channel_hermes_params,
+            )
             result = await self.zo.ask_stream(
                 user_input,
                 conversation_id=conv_id if conv_id else None,
@@ -1302,25 +1353,23 @@ class ZoDiscordBot(commands.Bot):
             await update_activity(thread_id)
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for thread {thread.id} (interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
-                if result.error_message:
-                    response = f"\u26a0\ufe0f **Request failed.**\n\n`{result.error_message[:200]}`\n\nSend another message to try again."
-                else:
-                    response, new_conv_id = await self._retry_empty_response(
-                        thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id,
-                        backend=channel_backend,
-                        honcho_session_key=honcho_session_key,
-                    )
-                    if response is None:
-                        logger.info(f"Cancelled notification turn in thread {thread_id}; not sending retry or fallback")
-                        return
+                logger.warning(f"Empty response for thread {thread.id} (status={result.turn_status or 'unknown'}, interrupted={result.interrupted}, events={result.received_events}, error={result.error_message!r})")
+                response, new_conv_id = await self._retry_empty_response(
+                    thread_id, new_conv_id or conv_id, thread, on_thinking, on_conv_id, result,
+                    backend=channel_backend,
+                    honcho_session_key=honcho_session_key,
+                )
+                if response is None:
+                    logger.info(f"Cancelled notification turn in thread {thread_id}; not sending retry or fallback")
+                    return
 
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
             if not chunks:
+                retry_attempts = self._consume_empty_response_retry_attempts(thread_id)
                 # All retries exhausted — show fallback
                 logger.error(f"All retries exhausted for thread {thread.id}")
-                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id or conv_id}`\n\nSend another message to try again."]
+                chunks = [self._build_empty_response_exhausted_message(new_conv_id or conv_id, retry_attempts)]
             await self._send_model_fallback_notice(thread, result.model_fallback)
             for i, chunk in enumerate(chunks):
                 kwargs = {"content": chunk}
@@ -1359,12 +1408,18 @@ class ZoDiscordBot(commands.Bot):
                     )
                     if not recovery_input:
                         raise RuntimeError("No cached user message available for response recovery")
+                    recovery_kwargs = self._build_empty_response_retry_kwargs(
+                        thread_id,
+                        recovery_conv_id,
+                        recovery_context,
+                        on_thinking,
+                        on_conv_id,
+                        backend=channel_backend,
+                        honcho_session_key=honcho_session_key,
+                    )
                     recovery_result = await self.zo.ask_stream(
                         recovery_input,
-                        conversation_id=recovery_conv_id,
-                        honcho_session_key=honcho_session_key,
-                        context=recovery_context,
-                        backend=channel_backend,
+                        **recovery_kwargs,
                     )
                     if recovery_result.conv_id != recovery_conv_id:
                         await update_conversation_id(thread_id, recovery_result.conv_id)
@@ -1447,6 +1502,20 @@ class ZoDiscordBot(commands.Bot):
         typing_task = asyncio.create_task(self.typing_loop(thread, stop_event))
         try:
             await self._send_hermes_model_fallback_notice(thread, effective_model, channel_backend)
+            self._cache_empty_response_request_envelope(
+                thread_id,
+                conversation_id=conv_id,
+                honcho_session_key=honcho_session_key,
+                context=None,
+                file_paths=None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                model_name=effective_model,
+                persona_id=effective_persona,
+                backend=channel_backend,
+                **channel_hermes_params,
+            )
             result = await self.zo.ask_stream(
                 user_input,
                 conversation_id=conv_id,
@@ -1549,6 +1618,95 @@ class ZoDiscordBot(commands.Bot):
         )
         return resend_input, resend_context
 
+    def _cache_empty_response_request_envelope(self, thread_id: str, **kwargs) -> None:
+        """Store the effective ask_stream envelope for transport-faithful recovery."""
+        thread_id = str(thread_id)
+        envelope = dict(kwargs)
+        file_paths = envelope.get("file_paths")
+        if file_paths is not None:
+            envelope["file_paths"] = list(file_paths)
+        self._empty_response_request_envelopes[thread_id] = envelope
+
+    def _build_empty_response_retry_kwargs(
+        self,
+        thread_id: str,
+        conv_id: str,
+        retry_context: str | None,
+        on_thinking,
+        on_conv_id,
+        *,
+        backend: str | None,
+        honcho_session_key: str | None,
+    ) -> dict:
+        """Replay the original effective request envelope for empty-response recovery."""
+        request_kwargs = dict(self._empty_response_request_envelopes.get(str(thread_id), {}))
+        request_kwargs["conversation_id"] = conv_id
+        request_kwargs["context"] = retry_context
+        request_kwargs["on_thinking"] = on_thinking
+        request_kwargs["on_conv_id"] = on_conv_id
+        if "backend" not in request_kwargs:
+            request_kwargs["backend"] = backend
+        if "honcho_session_key" not in request_kwargs and honcho_session_key is not None:
+            request_kwargs["honcho_session_key"] = honcho_session_key
+        return request_kwargs
+
+    def _classify_empty_response_recovery(self, result, backend: str | None) -> str:
+        """Choose the narrowest safe recovery path for an empty result."""
+        use_hermes = is_hermes(backend, self.zo.backend)
+        if not use_hermes:
+            return "direct"
+
+        turn_status = (result.turn_status or "").strip()
+        if turn_status in {"completed", "completed_streamed_only", "failed"}:
+            return "none"
+        if turn_status in {"partial", "empty_success"}:
+            return "direct"
+        if turn_status == "error":
+            return "status_gate"
+
+        # Old-bridge compatibility: empty Hermes results without the richer
+        # outcome envelope remain ambiguous, so keep the conservative poll path.
+        return "status_gate"
+
+    def _build_empty_response_message(self, result) -> str:
+        """Produce a user-facing fallback for resolved empty outcomes."""
+        detail = ""
+        if isinstance(result.terminal_result, dict):
+            detail = (result.terminal_result.get("error") or "").strip()
+        if not detail:
+            detail = (result.error_message or "").strip()
+
+        if result.turn_status == "failed":
+            if detail:
+                return f"⚠️ **Request failed.**\n\n`{detail[:200]}`\n\nSend another message to try again."
+            return "⚠️ **Request failed.**\n\nThe bridge reported a failed turn with no final output.\n\nSend another message to try again."
+
+        if result.turn_status in {"completed", "completed_streamed_only"}:
+            return "⚠️ **Request completed with no output.**\n\nSend another message to try again."
+
+        if detail:
+            return f"⚠️ **Request failed.**\n\n`{detail[:200]}`\n\nSend another message to try again."
+
+        return ""
+
+    def _record_empty_response_retry_attempt(self, thread_id: str) -> None:
+        thread_id = str(thread_id)
+        self._empty_response_retry_attempts[thread_id] = self._empty_response_retry_attempts.get(thread_id, 0) + 1
+
+    def _consume_empty_response_retry_attempts(self, thread_id: str) -> int:
+        return self._empty_response_retry_attempts.pop(str(thread_id), 0)
+
+    def _build_empty_response_exhausted_message(self, conv_id: str, retry_attempts: int) -> str:
+        if retry_attempts > 0:
+            return (
+                f"⚠️ **Zo didn't respond after multiple retries.**\n\nConversation: `{conv_id}`\n\n"
+                "Send another message to try again."
+            )
+        return (
+            f"⚠️ **Zo didn't respond.**\n\nConversation: `{conv_id}`\n\n"
+            "Send another message to try again."
+        )
+
     async def _retry_empty_response(
         self,
         thread_id: str,
@@ -1556,6 +1714,7 @@ class ZoDiscordBot(commands.Bot):
         thread: discord.Thread,
         on_thinking,
         on_conv_id,
+        result,
         backend: str = None,
         honcho_session_key: str | None = None,
     ) -> tuple[str | None, str]:
@@ -1573,20 +1732,23 @@ class ZoDiscordBot(commands.Bot):
             logger.info(f"Skipping empty-response retry for intentionally cancelled thread {thread_id}")
             return None, conv_id
 
+        recovery_mode = self._classify_empty_response_recovery(result, backend)
+        if recovery_mode == "none":
+            return self._build_empty_response_message(result), conv_id
+
         original_user_input = self._last_user_messages.get(thread_id)
         if not original_user_input:
             logger.error(f"No cached user message available for retry in thread {thread_id}")
             return "", conv_id
 
-        use_hermes = is_hermes(backend, self.zo.backend)
-
-        if use_hermes:
+        if recovery_mode == "status_gate":
             return await self._retry_with_status_gate(
                 conv_id, thread_id, original_user_input, on_thinking, on_conv_id, backend,
                 honcho_session_key=honcho_session_key,
             )
 
-        # Non-Hermes: retry by resending the latest real user turn with any queued follow-ups.
+        # Direct recovery resend for non-Hermes requests and Hermes turns with a
+        # resolved terminal outcome that still warrants one more pass.
         retry_delays = [30, 60, 120]
         for attempt, delay in enumerate(retry_delays, 1):
             logger.warning(f"Empty response (conv {conv_id}), recovery resend {attempt}/{len(retry_delays)} in {delay}s")
@@ -1598,14 +1760,19 @@ class ZoDiscordBot(commands.Bot):
                 return "", conv_id
 
             try:
+                self._record_empty_response_retry_attempt(thread_id)
+                retry_kwargs = self._build_empty_response_retry_kwargs(
+                    thread_id,
+                    conv_id,
+                    retry_context,
+                    on_thinking,
+                    on_conv_id,
+                    backend=backend,
+                    honcho_session_key=honcho_session_key,
+                )
                 result = await self.zo.ask_stream(
                     retry_input,
-                    conversation_id=conv_id,
-                    honcho_session_key=honcho_session_key,
-                    context=retry_context,
-                    on_thinking=on_thinking,
-                    on_conv_id=on_conv_id,
-                    backend=backend,
+                    **retry_kwargs,
                 )
                 if result.conv_id != conv_id:
                     await update_conversation_id(thread_id, result.conv_id)
@@ -1678,14 +1845,19 @@ class ZoDiscordBot(commands.Bot):
                 return "", conv_id
 
             try:
+                self._record_empty_response_retry_attempt(thread_id)
+                retry_kwargs = self._build_empty_response_retry_kwargs(
+                    thread_id,
+                    conv_id,
+                    retry_context,
+                    on_thinking,
+                    on_conv_id,
+                    backend=backend,
+                    honcho_session_key=honcho_session_key,
+                )
                 result = await self.zo.ask_stream(
                     retry_input,
-                    conversation_id=conv_id,
-                    honcho_session_key=honcho_session_key,
-                    context=retry_context,
-                    on_thinking=on_thinking,
-                    on_conv_id=on_conv_id,
-                    backend=backend,
+                    **retry_kwargs,
                 )
                 if result.conv_id != conv_id:
                     await update_conversation_id(thread_id, result.conv_id)
@@ -2660,6 +2832,22 @@ class ZoDiscordBot(commands.Bot):
             async def on_conv_id(cid: str):
                 await update_conversation_id(thread_id_str, cid)
 
+            self._last_user_messages[thread_id_str] = prompt
+            self._empty_response_retry_attempts.pop(thread_id_str, None)
+            self._cache_empty_response_request_envelope(
+                thread_id_str,
+                honcho_session_key=honcho_session_key,
+                context=context or None,
+                file_paths=file_paths or None,
+                on_thinking=on_thinking,
+                on_conv_id=on_conv_id,
+                on_clarify=on_clarify,
+                model_name=channel_model,
+                persona_id=effective_persona,
+                backend=channel_backend,
+                **channel_hermes_params,
+            )
+
             result = await self.zo.ask_stream(
                 prompt,
                 honcho_session_key=honcho_session_key,
@@ -2676,9 +2864,9 @@ class ZoDiscordBot(commands.Bot):
             response, new_conv_id = result.output, result.conv_id
 
             if not response or not response.strip():
-                logger.warning(f"Empty response for new thread {thread.id} (interrupted={result.interrupted}, events={result.received_events})")
+                logger.warning(f"Empty response for new thread {thread.id} (status={result.turn_status or 'unknown'}, interrupted={result.interrupted}, events={result.received_events})")
                 response, new_conv_id = await self._retry_empty_response(
-                    thread_id_str, new_conv_id, thread, on_thinking, on_conv_id,
+                    thread_id_str, new_conv_id, thread, on_thinking, on_conv_id, result,
                     backend=channel_backend,
                 )
                 if response is None:
@@ -2688,8 +2876,9 @@ class ZoDiscordBot(commands.Bot):
             chunks = self.zo.chunk_response(response)
             chunks = [c for c in chunks if c.strip()]
             if not chunks:
+                retry_attempts = self._consume_empty_response_retry_attempts(thread_id_str)
                 logger.error(f"All retries exhausted for new thread {thread.id}")
-                chunks = [f"\u26a0\ufe0f **Zo didn't respond after multiple retries.**\n\nConversation: `{new_conv_id}`\n\nSend another message to try again."]
+                chunks = [self._build_empty_response_exhausted_message(new_conv_id, retry_attempts)]
             for chunk in chunks:
                 await send_suppressed(thread, content=chunk)
 

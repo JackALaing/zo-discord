@@ -38,6 +38,8 @@ def make_bot():
     bot._queue_drain_suppressed = set()
     bot._presaved_attachments = {}
     bot._last_user_messages = {}
+    bot._empty_response_request_envelopes = {}
+    bot._empty_response_retry_attempts = {}
     bot._pending_clarify = {}
     bot._thread_digest_needed = set()
     bot._cancelled_threads = set()
@@ -368,6 +370,16 @@ class TestBotHelpers:
         bot.zo.ask_stream = AsyncMock(
             return_value=SimpleNamespace(output="Recovered response", conv_id="conv-1", model_fallback="")
         )
+        bot._empty_response_request_envelopes["thread-1"] = {
+            "backend": "hermes",
+            "model_name": "gpt-5.4",
+            "persona_id": "per_123",
+            "honcho_session_key": "stable-key",
+            "max_iterations": 7,
+            "reasoning_effort": "high",
+            "enabled_toolsets": ["web"],
+            "skip_memory": True,
+        }
 
         statuses = [
             {"state": "running", "iterations_used": 1, "iterations_max": 10},
@@ -390,10 +402,19 @@ class TestBotHelpers:
         assert conv_id == "conv-1"
         bot.zo.ask_stream.assert_awaited_once()
         sent_prompt = bot.zo.ask_stream.await_args.args[0]
-        sent_context = bot.zo.ask_stream.await_args.kwargs["context"]
+        sent_kwargs = bot.zo.ask_stream.await_args.kwargs
+        sent_context = sent_kwargs["context"]
         assert "Original user message for this turn" in sent_prompt
         assert "continue" in sent_prompt
         assert "transport-recovery resend" in sent_context
+        assert sent_kwargs["backend"] == "hermes"
+        assert sent_kwargs["model_name"] == "gpt-5.4"
+        assert sent_kwargs["persona_id"] == "per_123"
+        assert sent_kwargs["honcho_session_key"] == "stable-key"
+        assert sent_kwargs["max_iterations"] == 7
+        assert sent_kwargs["reasoning_effort"] == "high"
+        assert sent_kwargs["enabled_toolsets"] == ["web"]
+        assert sent_kwargs["skip_memory"] is True
 
     def test_send_model_fallback_notice_skips_duplicate_hermes_byok_notice(self):
         bot = make_bot()
@@ -407,6 +428,16 @@ class TestBotHelpers:
             )
 
         send_msg.assert_not_awaited()
+
+    def test_build_empty_response_exhausted_message_reflects_whether_retries_happened(self):
+        bot = make_bot()
+
+        no_retry_message = bot._build_empty_response_exhausted_message("conv-1", 0)
+        retried_message = bot._build_empty_response_exhausted_message("conv-1", 2)
+
+        assert "didn't respond after multiple retries" not in no_retry_message
+        assert "didn't respond." in no_retry_message
+        assert "didn't respond after multiple retries" in retried_message
 
     def test_retry_with_status_gate_returns_error_if_hermes_unreachable(self):
         bot = make_bot()
@@ -456,6 +487,110 @@ class TestBotHelpers:
         assert "Queued user messages received while the previous turn was in progress" in sent_prompt
         assert "[Jill]: follow up" in sent_prompt
 
+    def test_retry_empty_response_skips_retry_for_failed_terminal_status(self):
+        from zo_discord.zo_client import StreamResult
+
+        bot = make_bot()
+        thread = FakeThread()
+        result = StreamResult(
+            output="",
+            conv_id="conv-1",
+            interrupted=False,
+            received_events=True,
+            turn_status="failed",
+            terminal_result={"turn_status": "failed", "error": "tool timeout"},
+        )
+
+        with patch("zo_discord.bot.check_hermes_status", AsyncMock()) as status_mock:
+            output, conv_id = run(
+                bot._retry_empty_response(
+                    "thread-1", "conv-1", thread, AsyncMock(), AsyncMock(), result, backend="hermes"
+                )
+            )
+
+        assert "Request failed" in output
+        assert "tool timeout" in output
+        assert conv_id == "conv-1"
+        bot.zo.ask_stream.assert_not_awaited()
+        status_mock.assert_not_awaited()
+
+    def test_retry_empty_response_uses_direct_recovery_for_partial_status(self):
+        from zo_discord.zo_client import StreamResult
+
+        bot = make_bot()
+        thread = FakeThread()
+        bot._last_user_messages["thread-1"] = "continue"
+        bot._empty_response_request_envelopes["thread-1"] = {
+            "backend": "hermes",
+            "model_name": "gpt-5.4",
+            "persona_id": "per_123",
+            "honcho_session_key": "stable-key",
+            "max_iterations": 5,
+            "reasoning_effort": "medium",
+            "disabled_toolsets": ["vision"],
+            "skip_context": True,
+        }
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(output="Recovered response", conv_id="conv-1", model_fallback="")
+        )
+        result = StreamResult(
+            output="",
+            conv_id="conv-1",
+            interrupted=False,
+            received_events=True,
+            turn_status="partial",
+            terminal_result={"turn_status": "partial", "error": "tool timeout"},
+        )
+
+        with patch("zo_discord.bot.check_hermes_status", AsyncMock()) as status_mock, patch(
+            "zo_discord.bot.asyncio.sleep", AsyncMock()
+        ), patch("zo_discord.bot.update_conversation_id", AsyncMock()):
+            output, conv_id = run(
+                bot._retry_empty_response(
+                    "thread-1", "conv-1", thread, AsyncMock(), AsyncMock(), result, backend="hermes"
+                )
+            )
+
+        assert output == "Recovered response"
+        assert conv_id == "conv-1"
+        bot.zo.ask_stream.assert_awaited_once()
+        sent_kwargs = bot.zo.ask_stream.await_args.kwargs
+        assert sent_kwargs["backend"] == "hermes"
+        assert sent_kwargs["model_name"] == "gpt-5.4"
+        assert sent_kwargs["persona_id"] == "per_123"
+        assert sent_kwargs["honcho_session_key"] == "stable-key"
+        assert sent_kwargs["max_iterations"] == 5
+        assert sent_kwargs["reasoning_effort"] == "medium"
+        assert sent_kwargs["disabled_toolsets"] == ["vision"]
+        assert sent_kwargs["skip_context"] is True
+        status_mock.assert_not_awaited()
+
+    def test_retry_empty_response_uses_status_gate_for_transport_error(self):
+        from zo_discord.zo_client import StreamResult
+
+        bot = make_bot()
+        thread = FakeThread()
+        bot._last_user_messages["thread-1"] = "continue"
+        result = StreamResult(
+            output="",
+            conv_id="conv-1",
+            interrupted=True,
+            received_events=True,
+            error_message="boom",
+            turn_status="error",
+        )
+
+        with patch.object(bot, "_retry_with_status_gate", AsyncMock(return_value=("Recovered", "conv-1"))) as retry_gate:
+            output, conv_id = run(
+                bot._retry_empty_response(
+                    "thread-1", "conv-1", thread, AsyncMock(), AsyncMock(), result, backend="hermes"
+                )
+            )
+
+        assert output == "Recovered"
+        assert conv_id == "conv-1"
+        retry_gate.assert_awaited_once()
+
     def test_drain_queue_bundles_multiple_messages(self):
         bot = make_bot()
         bot._message_queues["thread-1"] = asyncio.Queue()
@@ -497,7 +632,19 @@ class TestBotHelpers:
         inflight_task = SimpleNamespace(done=lambda: True)
         bot._inflight[str(thread.id)] = {"conv_id": "conv-1", "task": inflight_task}
         bot.extract_overrides = lambda text: (None, None, text)
-        bot.resolve_channel_defaults = AsyncMock(return_value=(None, None, "hermes", {}))
+        bot.resolve_channel_defaults = AsyncMock(
+            return_value=(
+                "gpt-5.4",
+                "per_123",
+                "hermes",
+                {
+                    "max_iterations": 7,
+                    "reasoning_effort": "high",
+                    "enabled_toolsets": ["web"],
+                    "skip_memory": True,
+                },
+            )
+        )
         bot.build_thread_context = AsyncMock(return_value=("", []))
         bot.make_on_thinking = lambda _thread: AsyncMock()
         bot.make_on_clarify = lambda _thread: AsyncMock()
@@ -658,6 +805,66 @@ class TestBotHelpers:
         assert bot.zo.ask_stream.await_args.kwargs["persona_id"] == "per_123"
         assert bot.zo.ask_stream.await_args.kwargs["honcho_session_key"] == "stable-key"
 
+    def test_handle_thread_message_reconnect_recovery_reuses_cached_request_envelope(self):
+        bot = make_bot()
+        thread = FakeThread(parent=FakeParentChannel(channel_id=222, name="hermes"))
+        message = FakeMessage("follow up")
+        message.channel = thread
+        bot.extract_overrides = lambda text: (None, None, text)
+        bot.resolve_channel_defaults = AsyncMock(
+            return_value=(
+                "gpt-5.4",
+                "per_123",
+                "hermes",
+                {
+                    "max_iterations": 7,
+                    "reasoning_effort": "high",
+                    "enabled_toolsets": ["web"],
+                    "skip_memory": True,
+                },
+            )
+        )
+        bot.build_thread_context = AsyncMock(return_value=("thread context", ["/tmp/input.txt"]))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.make_on_clarify = lambda _thread: AsyncMock()
+        bot.typing_loop = AsyncMock()
+        bot._send_hermes_model_fallback_notice = AsyncMock()
+        bot.is_closed = lambda: False
+        bot.ws = SimpleNamespace(open=True)
+        bot.zo.ask_stream = AsyncMock(
+            side_effect=[
+                Exception("Zo API error 500: Internal Server Error"),
+                SimpleNamespace(output="Recovered response", conv_id="conv-1", model_fallback=""),
+            ]
+        )
+
+        with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
+            "zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value="stable-key")
+        ), patch("zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ) as send_msg, patch("zo_discord.bot.update_conversation_id", AsyncMock()), patch(
+            "zo_discord.bot.asyncio.sleep", AsyncMock()
+        ):
+            run(bot.handle_thread_message(message))
+
+        assert bot.zo.ask_stream.await_count == 2
+        resent_prompt = bot.zo.ask_stream.await_args_list[1].args[0]
+        resent_kwargs = bot.zo.ask_stream.await_args_list[1].kwargs
+        assert "Original user message for this turn" in resent_prompt
+        assert "follow up" in resent_prompt
+        assert resent_kwargs["conversation_id"] == "conv-1"
+        assert resent_kwargs["backend"] == "hermes"
+        assert resent_kwargs["model_name"] == "gpt-5.4"
+        assert resent_kwargs["persona_id"] == "per_123"
+        assert resent_kwargs["honcho_session_key"] == "stable-key"
+        assert resent_kwargs["max_iterations"] == 7
+        assert resent_kwargs["reasoning_effort"] == "high"
+        assert resent_kwargs["enabled_toolsets"] == ["web"]
+        assert resent_kwargs["skip_memory"] is True
+        assert resent_kwargs["file_paths"] == ["/tmp/input.txt"]
+        send_msg.assert_awaited_once()
+        assert send_msg.await_args.kwargs["content"] == "Recovered response"
+
     def test_handle_notify_stores_explicit_honcho_session_key(self):
         bot = make_bot()
 
@@ -746,7 +953,19 @@ class TestBotHelpers:
         message.guild = SimpleNamespace(id=999)
         message.create_thread = AsyncMock(return_value=thread)
         bot.extract_overrides = lambda text: (None, None, text)
-        bot.resolve_channel_defaults = AsyncMock(return_value=(None, None, "hermes", {}))
+        bot.resolve_channel_defaults = AsyncMock(
+            return_value=(
+                "gpt-5.4",
+                "per_123",
+                "hermes",
+                {
+                    "max_iterations": 7,
+                    "reasoning_effort": "high",
+                    "enabled_toolsets": ["web"],
+                    "skip_memory": True,
+                },
+            )
+        )
         bot.build_channel_context = AsyncMock(return_value=("", []))
         bot.make_on_thinking = lambda _thread: AsyncMock()
         bot.make_on_clarify = lambda _thread: AsyncMock()
@@ -775,6 +994,222 @@ class TestBotHelpers:
         assert save_mapping.await_args.kwargs["honcho_session_key"] == "discord-thread-333"
         assert bot.zo.ask_stream.await_args.kwargs["honcho_session_key"] == "discord-thread-333"
 
+    def test_handle_new_thread_retries_partial_empty_with_original_prompt(self):
+        from zo_discord.zo_client import StreamResult
+
+        bot = make_bot()
+
+        class NewThread:
+            def __init__(self):
+                self.id = 789
+                self.guild = SimpleNamespace(id=999)
+                self.sent = []
+
+            async def send(self, *args, **kwargs):
+                self.sent.append((args, kwargs))
+                return SimpleNamespace(id=len(self.sent))
+
+        class StarterMessage:
+            async def create_thread(self, name):
+                return thread
+
+        class NewThreadChannel:
+            id = 456
+            guild = SimpleNamespace(id=999)
+            name = "hermes"
+
+            async def send(self, _content):
+                return StarterMessage()
+
+        thread = NewThread()
+        request = make_mocked_request("POST", "/conversations/conv-0/new-thread")
+        request._post = None
+        request._match_info = {"conv_id": "conv-0"}
+        request.json = AsyncMock(
+            return_value={
+                "title": "Thread Title",
+                "prompt": "Please say nothing",
+                "channel_name": "hermes",
+            }
+        )
+        bot.resolve_channel_by_name = lambda _name: NewThreadChannel()
+        bot.resolve_channel_defaults = AsyncMock(
+            return_value=(
+                "gpt-5.4",
+                "per_123",
+                "hermes",
+                {
+                    "max_iterations": 7,
+                    "reasoning_effort": "high",
+                    "enabled_toolsets": ["web"],
+                    "skip_memory": True,
+                },
+            )
+        )
+        bot.build_channel_context = AsyncMock(return_value=("", []))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.make_on_clarify = lambda _thread: AsyncMock()
+        bot._send_hermes_model_fallback_notice = AsyncMock()
+        bot.zo.ask_stream = AsyncMock(
+            side_effect=[
+                StreamResult(
+                    output="",
+                    conv_id="conv-1",
+                    interrupted=False,
+                    received_events=True,
+                    turn_status="partial",
+                    terminal_result={"turn_status": "partial"},
+                ),
+                SimpleNamespace(output="Recovered response", conv_id="conv-1", model_fallback=""),
+            ]
+        )
+
+        with patch("zo_discord.bot.save_mapping", AsyncMock()), patch(
+            "zo_discord.bot.update_conversation_id", AsyncMock()
+        ), patch("zo_discord.bot.send_suppressed", AsyncMock()) as send_msg, patch(
+            "zo_discord.bot.asyncio.sleep", AsyncMock()
+        ):
+            response = run(bot.handle_new_thread(request))
+
+        assert response.status == 200
+        assert bot._last_user_messages[str(thread.id)] == "Please say nothing"
+        assert bot.zo.ask_stream.await_count == 2
+        resent_prompt = bot.zo.ask_stream.await_args_list[1].args[0]
+        resent_kwargs = bot.zo.ask_stream.await_args_list[1].kwargs
+        assert "Original user message for this turn" in resent_prompt
+        assert "Please say nothing" in resent_prompt
+        assert resent_kwargs["backend"] == "hermes"
+        assert resent_kwargs["model_name"] == "gpt-5.4"
+        assert resent_kwargs["persona_id"] == "per_123"
+        assert resent_kwargs["honcho_session_key"] == "discord-thread-789"
+        assert resent_kwargs["max_iterations"] == 7
+        assert resent_kwargs["reasoning_effort"] == "high"
+        assert resent_kwargs["enabled_toolsets"] == ["web"]
+        assert resent_kwargs["skip_memory"] is True
+        send_msg.assert_awaited_once_with(thread, content="Recovered response")
+
+    def test_handle_new_thread_fallback_does_not_claim_retries_when_none_attempted(self):
+        bot = make_bot()
+
+        class NewThread:
+            def __init__(self):
+                self.id = 789
+                self.guild = SimpleNamespace(id=999)
+
+            async def send(self, *args, **kwargs):
+                return SimpleNamespace(id=1)
+
+        class StarterMessage:
+            async def create_thread(self, name):
+                return thread
+
+        class NewThreadChannel:
+            id = 456
+            guild = SimpleNamespace(id=999)
+            name = "hermes"
+
+            async def send(self, _content):
+                return StarterMessage()
+
+        thread = NewThread()
+        request = make_mocked_request("POST", "/conversations/conv-0/new-thread")
+        request._post = None
+        request._match_info = {"conv_id": "conv-0"}
+        request.json = AsyncMock(
+            return_value={
+                "title": "Thread Title",
+                "prompt": "Please say nothing",
+                "channel_name": "hermes",
+            }
+        )
+        bot.resolve_channel_by_name = lambda _name: NewThreadChannel()
+        bot.resolve_channel_defaults = AsyncMock(return_value=(None, None, "hermes", {}))
+        bot.build_channel_context = AsyncMock(return_value=("", []))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.make_on_clarify = lambda _thread: AsyncMock()
+        bot._send_hermes_model_fallback_notice = AsyncMock()
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(
+                output="",
+                conv_id="conv-1",
+                interrupted=False,
+                received_events=True,
+                turn_status="partial",
+            )
+        )
+
+        with patch("zo_discord.bot.save_mapping", AsyncMock()), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ) as send_msg, patch.object(
+            bot, "_retry_empty_response", AsyncMock(return_value=("", "conv-1"))
+        ):
+            response = run(bot.handle_new_thread(request))
+
+        assert response.status == 200
+        send_msg.assert_awaited_once()
+        fallback_text = send_msg.await_args.kwargs["content"]
+        assert "didn't respond after multiple retries" not in fallback_text
+        assert "didn't respond" in fallback_text
+
+    def test_handle_new_thread_success_still_sends_single_response(self):
+        bot = make_bot()
+
+        class NewThread:
+            def __init__(self):
+                self.id = 789
+                self.guild = SimpleNamespace(id=999)
+
+            async def send(self, *args, **kwargs):
+                return SimpleNamespace(id=1)
+
+        class StarterMessage:
+            async def create_thread(self, name):
+                return thread
+
+        class NewThreadChannel:
+            id = 456
+            guild = SimpleNamespace(id=999)
+            name = "hermes"
+
+            async def send(self, _content):
+                return StarterMessage()
+
+        thread = NewThread()
+        request = make_mocked_request("POST", "/conversations/conv-0/new-thread")
+        request._post = None
+        request._match_info = {"conv_id": "conv-0"}
+        request.json = AsyncMock(
+            return_value={
+                "title": "Thread Title",
+                "prompt": "Say hello",
+                "channel_name": "hermes",
+            }
+        )
+        bot.resolve_channel_by_name = lambda _name: NewThreadChannel()
+        bot.resolve_channel_defaults = AsyncMock(return_value=(None, None, "hermes", {}))
+        bot.build_channel_context = AsyncMock(return_value=("", []))
+        bot.make_on_thinking = lambda _thread: AsyncMock()
+        bot.make_on_clarify = lambda _thread: AsyncMock()
+        bot._send_hermes_model_fallback_notice = AsyncMock()
+        bot.zo.ask_stream = AsyncMock(
+            return_value=SimpleNamespace(
+                output="Hello there",
+                conv_id="conv-1",
+                interrupted=False,
+                received_events=True,
+                turn_status="completed",
+            )
+        )
+
+        with patch("zo_discord.bot.save_mapping", AsyncMock()), patch(
+            "zo_discord.bot.send_suppressed", AsyncMock()
+        ) as send_msg:
+            response = run(bot.handle_new_thread(request))
+
+        assert response.status == 200
+        bot.zo.ask_stream.assert_awaited_once()
+        send_msg.assert_awaited_once_with(thread, content="Hello there")
+
     def test_drain_queue_skips_during_interrupt_handoff(self):
         bot = make_bot()
         thread = FakeThread()
@@ -790,9 +1225,12 @@ class TestBotHelpers:
         assert bot._message_queues[str(thread.id)].qsize() == 1
 
     def test_retry_empty_response_skips_retry_for_intentional_cancel(self):
+        from zo_discord.zo_client import StreamResult
+
         bot = make_bot()
         thread = FakeThread()
         bot.mark_thread_cancelled(str(thread.id))
+        result = StreamResult(output="", conv_id="conv-1", interrupted=True, received_events=True, turn_status="error")
 
         with patch("zo_discord.bot.check_hermes_status", AsyncMock()) as status_mock:
             response, conv_id = run(
@@ -802,6 +1240,7 @@ class TestBotHelpers:
                     thread,
                     AsyncMock(),
                     AsyncMock(),
+                    result,
                     backend="hermes",
                 )
             )
