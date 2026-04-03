@@ -205,6 +205,52 @@ class TestChunking:
         joined = "".join(c.lstrip("\u200b\n") for c in chunks)
         assert "a" * 200 in joined
 
+    def test_long_list_preserves_newlines_and_bullets(self):
+        client = make_client()
+        client.max_length = 300
+        text = "\n".join([
+            "# Recommended Changes",
+            "- First item with enough text to force the chunker to treat the whole block as a long section. " * 6,
+            "- Second item should stay on its own bullet line instead of collapsing into the heading. " * 6,
+            "- Third item should also preserve its line break and bullet marker. " * 6,
+        ])
+        chunks = client.chunk_response(text)
+        joined = "\n".join(c.lstrip("\u200b\n") for c in chunks)
+
+        assert len(chunks) > 1
+        assert "# Recommended Changes\n- First item" in joined
+        assert "\n- Second item" in joined
+        assert "\n- Third item" in joined
+
+    def test_split_code_block_preserves_line_breaks_and_fences(self):
+        client = make_client()
+        client.max_length = 80
+        text = "# Header\n\n```python\n" + ("print('hello')\n" * 15) + "```\n\nAfter."
+        chunks = client.chunk_response(text)
+
+        for chunk in chunks:
+            raw = chunk.lstrip("\u200b\n")
+            fence_count = raw.count("```")
+            assert fence_count % 2 == 0, f"Unbalanced fences in chunk: {raw}"
+            if "print('hello')" in raw:
+                assert "print('hello')\nprint('hello')" in raw or raw.endswith("print('hello')\n```")
+
+        joined = "\n".join(c.lstrip("\u200b\n") for c in chunks)
+        assert "```python\nprint('hello')" in joined
+        assert "print('hello')\n```" in joined
+        assert "```\n\nAfter." in joined
+
+    def test_split_inline_code_keeps_balanced_backticks(self):
+        client = make_client()
+        client.max_length = 80
+        text = "- This bullet has `inline code with spaces inside` and enough trailing prose to force a split. " * 4
+        chunks = client.chunk_response(text)
+
+        assert len(chunks) > 1
+        for chunk in chunks:
+            raw = chunk.lstrip("\u200b\n")
+            assert raw.count("`") % 2 == 0, f"Unbalanced inline code in chunk: {raw}"
+
 
 # ── generate_thread_title_simple ──────────────────────────────────────
 
