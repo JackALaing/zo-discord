@@ -32,6 +32,19 @@ HERMES_PAYLOAD_KEYS = (
 )
 
 
+def _canonicalize_file_path_for_dedupe(raw_path: str) -> str:
+    path = Path(raw_path).expanduser()
+
+    if not path.exists():
+        parts = path.parts
+        if len(parts) >= 4 and parts[:3] == ("/", "home", "workspace") and parts[3] == "Skills" and len(parts) == 5:
+            service_skill = Path("/home/workspace/Services") / parts[4] / "skill"
+            if service_skill.exists():
+                path = service_skill
+
+    return str(path.resolve(strict=False))
+
+
 def _dedupe_file_paths(file_paths: list[str] | None = None) -> list[str]:
     if not file_paths:
         return []
@@ -39,7 +52,7 @@ def _dedupe_file_paths(file_paths: list[str] | None = None) -> list[str]:
     seen = set()
     for raw_path in file_paths:
         try:
-            key = str(Path(raw_path).expanduser().resolve(strict=False))
+            key = _canonicalize_file_path_for_dedupe(raw_path)
         except Exception:
             key = raw_path
         if key in seen:
@@ -158,7 +171,7 @@ class ZoClient:
         self,
         input_text: str,
         conversation_id: str = None,
-        honcho_session_key: str = None,
+        memory_session_title: str = None,
         context: str = None,
         file_paths: list[str] = None,
         on_thinking: Callable[[str], Awaitable[None]] = None,
@@ -180,7 +193,7 @@ class ZoClient:
         Args:
             input_text: The user's message
             conversation_id: Optional existing conversation ID
-            honcho_session_key: Stable Honcho session key for Hermes-backed threads
+            memory_session_title: Stable memory session title for Hermes-backed threads
             context: Optional context string appended after the user message
             file_paths: Optional list of file paths referenced in the context
             on_thinking: Async callback for thinking previews (receives text to post)
@@ -210,8 +223,8 @@ class ZoClient:
             payload["model_name"] = effective_model
         if conversation_id:
             payload["conversation_id"] = conversation_id
-        if use_hermes_backend and honcho_session_key:
-            payload["honcho_session_key"] = honcho_session_key
+        if use_hermes_backend and memory_session_title:
+            payload["memory_session_title"] = memory_session_title
         if persona_id:
             payload["persona_id"] = persona_id
         if ephemeral_system_prompt:

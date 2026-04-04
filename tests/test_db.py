@@ -39,7 +39,7 @@ class TestThreadMappings:
         assert mapping["thread_id"] == "thread-1"
         assert mapping["thread_name"] == "Test Thread"
 
-    def test_migration_adds_honcho_session_key_column(self, tmp_path):
+    def test_migration_adds_memory_session_title_column(self, tmp_path):
         db = configure_db(tmp_path)
 
         async def get_columns():
@@ -48,27 +48,27 @@ class TestThreadMappings:
                 return [row[1] for row in await cursor.fetchall()]
 
         columns = run(get_columns())
-        assert "honcho_session_key" in columns
+        assert "memory_session_title" in columns
 
-    def test_honcho_session_key_round_trip_and_update(self, tmp_path):
+    def test_memory_session_title_round_trip_and_update(self, tmp_path):
         db = configure_db(tmp_path)
 
         run(
             db.save_mapping(
                 thread_id="thread-1",
                 conversation_id="conv-1",
-                honcho_session_key="discord-thread-1",
+                memory_session_title="discord-thread-1",
                 channel_id="channel-1",
                 guild_id="guild-1",
                 thread_name="Test Thread",
             )
         )
-        assert run(db.get_honcho_session_key("thread-1")) == "discord-thread-1"
+        assert run(db.get_memory_session_title("thread-1")) == "discord-thread-1"
 
-        run(db.update_honcho_session_key("thread-1", "conv-1"))
-        assert run(db.get_honcho_session_key("thread-1")) == "conv-1"
+        run(db.update_memory_session_title("thread-1", "conv-1"))
+        assert run(db.get_memory_session_title("thread-1")) == "conv-1"
 
-    def test_resolve_honcho_session_key_backfills_from_conversation_id(self, tmp_path):
+    def test_resolve_memory_session_title_backfills_from_conversation_id(self, tmp_path):
         db = configure_db(tmp_path)
 
         run(
@@ -81,12 +81,12 @@ class TestThreadMappings:
             )
         )
 
-        key = run(db.resolve_honcho_session_key("thread-1"))
+        key = run(db.resolve_memory_session_title("thread-1"))
 
         assert key == "conv-1"
-        assert run(db.get_honcho_session_key("thread-1")) == "conv-1"
+        assert run(db.get_memory_session_title("thread-1")) == "conv-1"
 
-    def test_resolve_honcho_session_key_backfills_from_thread_id_when_conversation_empty(self, tmp_path):
+    def test_resolve_memory_session_title_backfills_from_thread_id_when_conversation_empty(self, tmp_path):
         db = configure_db(tmp_path)
 
         run(
@@ -99,10 +99,10 @@ class TestThreadMappings:
             )
         )
 
-        key = run(db.resolve_honcho_session_key("thread-2"))
+        key = run(db.resolve_memory_session_title("thread-2"))
 
         assert key == "discord-thread-thread-2"
-        assert run(db.get_honcho_session_key("thread-2")) == "discord-thread-thread-2"
+        assert run(db.get_memory_session_title("thread-2")) == "discord-thread-thread-2"
 
 
 class TestChannelConfig:

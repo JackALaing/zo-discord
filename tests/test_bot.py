@@ -374,7 +374,7 @@ class TestBotHelpers:
             "backend": "hermes",
             "model_name": "gpt-5.4",
             "persona_id": "per_123",
-            "honcho_session_key": "stable-key",
+            "memory_session_title": "stable-key",
             "max_iterations": 7,
             "reasoning_effort": "high",
             "enabled_toolsets": ["web"],
@@ -410,7 +410,7 @@ class TestBotHelpers:
         assert sent_kwargs["backend"] == "hermes"
         assert sent_kwargs["model_name"] == "gpt-5.4"
         assert sent_kwargs["persona_id"] == "per_123"
-        assert sent_kwargs["honcho_session_key"] == "stable-key"
+        assert sent_kwargs["memory_session_title"] == "stable-key"
         assert sent_kwargs["max_iterations"] == 7
         assert sent_kwargs["reasoning_effort"] == "high"
         assert sent_kwargs["enabled_toolsets"] == ["web"]
@@ -524,7 +524,7 @@ class TestBotHelpers:
             "backend": "hermes",
             "model_name": "gpt-5.4",
             "persona_id": "per_123",
-            "honcho_session_key": "stable-key",
+            "memory_session_title": "stable-key",
             "max_iterations": 5,
             "reasoning_effort": "medium",
             "disabled_toolsets": ["vision"],
@@ -558,7 +558,7 @@ class TestBotHelpers:
         assert sent_kwargs["backend"] == "hermes"
         assert sent_kwargs["model_name"] == "gpt-5.4"
         assert sent_kwargs["persona_id"] == "per_123"
-        assert sent_kwargs["honcho_session_key"] == "stable-key"
+        assert sent_kwargs["memory_session_title"] == "stable-key"
         assert sent_kwargs["max_iterations"] == 5
         assert sent_kwargs["reasoning_effort"] == "medium"
         assert sent_kwargs["disabled_toolsets"] == ["vision"]
@@ -615,7 +615,7 @@ class TestBotHelpers:
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})
-        ), patch("zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value=None)), patch(
+        ), patch("zo_discord.bot.resolve_memory_session_title", AsyncMock(return_value=None)), patch(
             "zo_discord.bot.send_suppressed", AsyncMock()
         ) as send_msg:
             run(bot.handle_thread_message(message))
@@ -687,7 +687,7 @@ class TestBotHelpers:
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "interrupt"})
-        ), patch("zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value=None)), patch(
+        ), patch("zo_discord.bot.resolve_memory_session_title", AsyncMock(return_value=None)), patch(
             "zo_discord.bot.aiohttp.ClientSession", FakeClientSession
         ), patch("zo_discord.bot.check_hermes_status", fake_status), patch(
             "zo_discord.bot.send_suppressed", AsyncMock()
@@ -754,7 +754,7 @@ class TestBotHelpers:
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "interrupt"})
-        ), patch("zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value=None)), patch(
+        ), patch("zo_discord.bot.resolve_memory_session_title", AsyncMock(return_value=None)), patch(
             "zo_discord.bot.aiohttp.ClientSession", FakeClientSession
         ), patch("zo_discord.bot.check_hermes_status", fake_status), patch(
             "zo_discord.bot.send_suppressed", AsyncMock()
@@ -794,7 +794,7 @@ class TestBotHelpers:
         )
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
-            "zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value="stable-key")), patch(
+            "zo_discord.bot.resolve_memory_session_title", AsyncMock(return_value="stable-key")), patch(
             "zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})
         ), patch("zo_discord.bot.update_activity", AsyncMock()), patch(
             "zo_discord.bot.send_suppressed", AsyncMock()
@@ -803,7 +803,7 @@ class TestBotHelpers:
 
         assert bot.zo.ask_stream.await_args.kwargs["model_name"] == "byok:test-model"
         assert bot.zo.ask_stream.await_args.kwargs["persona_id"] == "per_123"
-        assert bot.zo.ask_stream.await_args.kwargs["honcho_session_key"] == "stable-key"
+        assert bot.zo.ask_stream.await_args.kwargs["memory_session_title"] == "stable-key"
 
     def test_handle_thread_message_reconnect_recovery_reuses_cached_request_envelope(self):
         bot = make_bot()
@@ -839,7 +839,7 @@ class TestBotHelpers:
         )
 
         with patch("zo_discord.bot.get_conversation_id", AsyncMock(return_value="conv-1")), patch(
-            "zo_discord.bot.resolve_honcho_session_key", AsyncMock(return_value="stable-key")
+            "zo_discord.bot.resolve_memory_session_title", AsyncMock(return_value="stable-key")
         ), patch("zo_discord.bot.get_channel_config", AsyncMock(return_value={"message_mode": "queue"})), patch(
             "zo_discord.bot.send_suppressed", AsyncMock()
         ) as send_msg, patch("zo_discord.bot.update_conversation_id", AsyncMock()), patch(
@@ -856,7 +856,7 @@ class TestBotHelpers:
         assert resent_kwargs["backend"] == "hermes"
         assert resent_kwargs["model_name"] == "gpt-5.4"
         assert resent_kwargs["persona_id"] == "per_123"
-        assert resent_kwargs["honcho_session_key"] == "stable-key"
+        assert resent_kwargs["memory_session_title"] == "stable-key"
         assert resent_kwargs["max_iterations"] == 7
         assert resent_kwargs["reasoning_effort"] == "high"
         assert resent_kwargs["enabled_toolsets"] == ["web"]
@@ -865,7 +865,7 @@ class TestBotHelpers:
         send_msg.assert_awaited_once()
         assert send_msg.await_args.kwargs["content"] == "Recovered response"
 
-    def test_handle_notify_stores_explicit_honcho_session_key(self):
+    def test_handle_notify_stores_explicit_memory_session_title(self):
         bot = make_bot()
 
         class NotifyThread:
@@ -892,7 +892,7 @@ class TestBotHelpers:
                 "title": "Thread Title",
                 "content": "",
                 "conversation_id": "conv-1",
-                "honcho_session_key": "stable-key",
+                "memory_session_title": "stable-key",
             }
         )
         bot.resolve_channel_by_name = lambda _name: NotifyChannel()
@@ -903,9 +903,9 @@ class TestBotHelpers:
             response = run(bot.handle_notify(request))
 
         assert response.status == 200
-        assert save_mapping.await_args.kwargs["honcho_session_key"] == "stable-key"
+        assert save_mapping.await_args.kwargs["memory_session_title"] == "stable-key"
 
-    def test_handle_notify_falls_back_to_conversation_id_for_honcho_session_key(self):
+    def test_handle_notify_falls_back_to_conversation_id_for_memory_session_title(self):
         bot = make_bot()
 
         class NotifyThread:
@@ -942,9 +942,9 @@ class TestBotHelpers:
             response = run(bot.handle_notify(request))
 
         assert response.status == 200
-        assert save_mapping.await_args.kwargs["honcho_session_key"] == "conv-1"
+        assert save_mapping.await_args.kwargs["memory_session_title"] == "conv-1"
 
-    def test_handle_channel_message_seeds_thread_honcho_session_key(self):
+    def test_handle_channel_message_seeds_thread_memory_session_title(self):
         bot = make_bot()
         channel = FakeParentChannel(channel_id=222, name="hermes")
         thread = FakeThread(thread_id=333, name="Thread Title", parent=channel)
@@ -991,8 +991,8 @@ class TestBotHelpers:
         ):
             run(bot.handle_channel_message(message))
 
-        assert save_mapping.await_args.kwargs["honcho_session_key"] == "discord-thread-333"
-        assert bot.zo.ask_stream.await_args.kwargs["honcho_session_key"] == "discord-thread-333"
+        assert save_mapping.await_args.kwargs["memory_session_title"] == "discord-thread-333"
+        assert bot.zo.ask_stream.await_args.kwargs["memory_session_title"] == "discord-thread-333"
 
     def test_handle_new_thread_retries_partial_empty_with_original_prompt(self):
         from zo_discord.zo_client import StreamResult
@@ -1081,7 +1081,7 @@ class TestBotHelpers:
         assert resent_kwargs["backend"] == "hermes"
         assert resent_kwargs["model_name"] == "gpt-5.4"
         assert resent_kwargs["persona_id"] == "per_123"
-        assert resent_kwargs["honcho_session_key"] == "discord-thread-789"
+        assert resent_kwargs["memory_session_title"] == "discord-thread-789"
         assert resent_kwargs["max_iterations"] == 7
         assert resent_kwargs["reasoning_effort"] == "high"
         assert resent_kwargs["enabled_toolsets"] == ["web"]
