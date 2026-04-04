@@ -170,27 +170,6 @@ def _display_persona(persona_id: str | None) -> str:
     return f"`{persona_id}`"
 
 
-# --- Model Views/Modals ---
-
-class ModelSelectView(ui.View):
-    def __init__(self, bot, current_global: str | None, current_channel: str | None, channel_id: str | None):
-        super().__init__(timeout=120)
-        self.bot = bot
-        self.current_global = current_global
-        self.current_channel = current_channel
-        self.channel_id = channel_id
-
-    @ui.button(label="Change Global", style=discord.ButtonStyle.primary)
-    async def change_global(self, button: ui.Button, interaction: discord.Interaction):
-        modal = GlobalModelModal(self.bot, self.current_global)
-        await interaction.response.send_modal(modal)
-
-    @ui.button(label="Change Channel", style=discord.ButtonStyle.secondary)
-    async def change_channel(self, button: ui.Button, interaction: discord.Interaction):
-        modal = ChannelModelModal(self.bot, self.current_channel, self.channel_id)
-        await interaction.response.send_modal(modal)
-
-
 class GlobalModelModal(ui.Modal):
     def __init__(self, bot, current_model: str | None):
         super().__init__(title="Set Global Default Model")
@@ -240,9 +219,9 @@ class ChannelModelModal(ui.Modal):
         )
 
 
-# --- Persona Views/Modals ---
+# --- Model Views/Modals ---
 
-class PersonaSelectView(ui.View):
+class ModelSelectView(ui.View):
     def __init__(self, bot, current_global: str | None, current_channel: str | None, channel_id: str | None):
         super().__init__(timeout=120)
         self.bot = bot
@@ -252,12 +231,12 @@ class PersonaSelectView(ui.View):
 
     @ui.button(label="Change Global", style=discord.ButtonStyle.primary)
     async def change_global(self, button: ui.Button, interaction: discord.Interaction):
-        modal = GlobalPersonaModal(self.bot, self.current_global)
+        modal = GlobalModelModal(self.bot, self.current_global)
         await interaction.response.send_modal(modal)
 
     @ui.button(label="Change Channel", style=discord.ButtonStyle.secondary)
     async def change_channel(self, button: ui.Button, interaction: discord.Interaction):
-        modal = ChannelPersonaModal(self.bot, self.current_channel, self.channel_id)
+        modal = ChannelModelModal(self.bot, self.current_channel, self.channel_id)
         await interaction.response.send_modal(modal)
 
 
@@ -309,6 +288,27 @@ class ChannelPersonaModal(ui.Modal):
         )
 
 
+# --- Persona Views/Modals ---
+
+class PersonaSelectView(ui.View):
+    def __init__(self, bot, current_global: str | None, current_channel: str | None, channel_id: str | None):
+        super().__init__(timeout=120)
+        self.bot = bot
+        self.current_global = current_global
+        self.current_channel = current_channel
+        self.channel_id = channel_id
+
+    @ui.button(label="Change Global", style=discord.ButtonStyle.primary)
+    async def change_global(self, button: ui.Button, interaction: discord.Interaction):
+        modal = GlobalPersonaModal(self.bot, self.current_global)
+        await interaction.response.send_modal(modal)
+
+    @ui.button(label="Change Channel", style=discord.ButtonStyle.secondary)
+    async def change_channel(self, button: ui.Button, interaction: discord.Interaction):
+        modal = ChannelPersonaModal(self.bot, self.current_channel, self.channel_id)
+        await interaction.response.send_modal(modal)
+
+
 class ThinkingSelectView(ui.View):
     def __init__(self, bot):
         super().__init__(timeout=60)
@@ -355,25 +355,6 @@ class AutoArchiveSelectView(ui.View):
             content="Auto-archive **enabled**. Discord will auto-archive inactive threads.",
             view=None,
         )
-
-
-class BufferSelectView(ui.View):
-    def __init__(self, bot, current_global: float, current_channel: float | None, channel_id: str | None):
-        super().__init__(timeout=120)
-        self.bot = bot
-        self.current_global = current_global
-        self.current_channel = current_channel
-        self.channel_id = channel_id
-
-    @ui.button(label="Change Global", style=discord.ButtonStyle.primary)
-    async def change_global(self, button: ui.Button, interaction: discord.Interaction):
-        modal = GlobalBufferModal(self.bot, self.current_global)
-        await interaction.response.send_modal(modal)
-
-    @ui.button(label="Change Channel", style=discord.ButtonStyle.secondary)
-    async def change_channel(self, button: ui.Button, interaction: discord.Interaction):
-        modal = ChannelBufferModal(self.bot, self.current_channel, self.channel_id)
-        await interaction.response.send_modal(modal)
 
 
 class GlobalBufferModal(ui.Modal):
@@ -437,14 +418,22 @@ class ChannelBufferModal(ui.Modal):
         await interaction.response.send_message(f"Channel buffer updated to {status}.", ephemeral=True)
 
 
-class AllowedUsersView(ui.View):
-    def __init__(self, bot):
+class BufferSelectView(ui.View):
+    def __init__(self, bot, current_global: float, current_channel: float | None, channel_id: str | None):
         super().__init__(timeout=120)
         self.bot = bot
+        self.current_global = current_global
+        self.current_channel = current_channel
+        self.channel_id = channel_id
 
-    @ui.button(label="Add/Remove User", style=discord.ButtonStyle.primary)
-    async def toggle_user(self, button: ui.Button, interaction: discord.Interaction):
-        modal = AllowedUserModal(self.bot)
+    @ui.button(label="Change Global", style=discord.ButtonStyle.primary)
+    async def change_global(self, button: ui.Button, interaction: discord.Interaction):
+        modal = GlobalBufferModal(self.bot, self.current_global)
+        await interaction.response.send_modal(modal)
+
+    @ui.button(label="Change Channel", style=discord.ButtonStyle.secondary)
+    async def change_channel(self, button: ui.Button, interaction: discord.Interaction):
+        modal = ChannelBufferModal(self.bot, self.current_channel, self.channel_id)
         await interaction.response.send_modal(modal)
 
 
@@ -476,6 +465,17 @@ class AllowedUserModal(ui.Modal):
             f"User `{user_id}` {action} allowed users.\n\nCurrent list: {', '.join(f'`{u}`' for u in allowed) or '(empty — all users allowed)'}",
             ephemeral=True,
         )
+
+
+class AllowedUsersView(ui.View):
+    def __init__(self, bot):
+        super().__init__(timeout=120)
+        self.bot = bot
+
+    @ui.button(label="Add/Remove User", style=discord.ButtonStyle.primary)
+    async def toggle_user(self, button: ui.Button, interaction: discord.Interaction):
+        modal = AllowedUserModal(self.bot)
+        await interaction.response.send_modal(modal)
 
 
 class BackendSelectView(ui.View):

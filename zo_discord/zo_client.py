@@ -505,6 +505,221 @@ class ZoClient:
 
         return title or "New conversation"
 
+    def _split_by_topics(self, text: str) -> list[str]:
+        """Split text into topic sections at meaningful boundaries."""
+        # Split on bold headers, markdown headers, horizontal rules, or numbered items after blank lines
+        pattern = r'\n\n(?=\*\*[^*]+\*\*[:\s]|#{1,3}\s|\-{3,}|\d+\.\s)'
+        parts = re.split(pattern, text)
+
+        # Remove empty parts and strip
+        sections = [p.strip() for p in parts if p.strip()]
+
+        # If no topic splits found, fall back to paragraph splitting
+        # but keep headings attached to the paragraph that follows them
+        if len(sections) <= 1:
+            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+            sections = []
+            for para in paragraphs:
+                # If this paragraph is a heading, attach it to the next paragraph
+                if re.match(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)', para):
+                    sections.append(para)
+                elif sections and re.match(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)', sections[-1]):
+                    # Previous section was a bare heading — merge
+                    sections[-1] = sections[-1] + "\n\n" + para
+                else:
+                    sections.append(para)
+
+        return sections
+
+    def _is_fenced_code_block(self, paragraph: str) -> bool:
+        lines = paragraph.split("\n")
+        if len(lines) < 2:
+            return False
+        return lines[0].startswith("```") and lines[-1].startswith("```")
+
+    def _tokenize_line_preserving_inline_code(self, line: str) -> list[str]:
+        tokens: list[str] = []
+        index = 0
+        inline_code_re = re.compile(r'`[^`\n]*`')
+
+        for match in inline_code_re.finditer(line):
+            if match.start() > index:
+                tokens.extend(re.findall(r'\S+\s*', line[index:match.start()]))
+            tokens.append(match.group(0))
+            trailing_ws_match = re.match(r'\s*', line[match.end():])
+            if trailing_ws_match and trailing_ws_match.group(0):
+                tokens[-1] += trailing_ws_match.group(0)
+                index = match.end() + len(trailing_ws_match.group(0))
+            else:
+                index = match.end()
+
+        if index < len(line):
+            tokens.extend(re.findall(r'\S+\s*', line[index:]))
+
+        return tokens
+
+    def _split_long_line(self, line: str, max_length: int | None = None) -> list[str]:
+        """Split one long line, preserving spaces and inline code spans when possible."""
+        max_length = max_length or self.max_length
+        if len(line) <= max_length:
+            return [line]
+
+        tokens = self._tokenize_line_preserving_inline_code(line)
+        if not tokens:
+            return [line[i:i + max_length] for i in range(0, len(line), max_length)]
+
+        parts: list[str] = []
+        current = ""
+        for token in tokens:
+            if len(token) > max_length:
+                if current:
+                    parts.append(current.rstrip())
+                    current = ""
+                parts.extend(token[i:i + max_length] for i in range(0, len(token), max_length))
+                continue
+
+            if len(current) + len(token) <= max_length:
+                current += token
+            else:
+                if current:
+                    parts.append(current.rstrip())
+                current = token
+
+        if current:
+            parts.append(current.rstrip())
+
+        return parts or [line]
+
+    def _split_fenced_code_block(self, paragraph: str) -> list[str]:
+        """Split a fenced code block into independently valid fenced chunks."""
+        lines = paragraph.split("\n")
+        opener = lines[0]
+        closer = lines[-1]
+        body_lines = lines[1:-1]
+        overhead = len(opener) + len(closer) + 2
+        body_limit = max(1, self.max_length - overhead)
+
+        chunks: list[str] = []
+        current_body = ""
+
+        for line in body_lines:
+            line_parts = self._split_long_line(line, max_length=body_limit)
+            for part in line_parts:
+                candidate = current_body + ("\n" if current_body else "") + part
+                if current_body and len(candidate) > body_limit:
+                    chunks.append(f"{opener}\n{current_body}\n{closer}")
+                    current_body = part
+                else:
+                    current_body = candidate
+
+        if current_body or not chunks:
+            chunks.append(f"{opener}\n{current_body}\n{closer}" if current_body else f"{opener}\n{closer}")
+
+        return chunks
+
+    def _split_oversize_paragraph(self, paragraph: str) -> list[str]:
+        """Split an oversize paragraph without collapsing single newlines."""
+        if self._is_fenced_code_block(paragraph):
+            return self._split_fenced_code_block(paragraph)
+
+        lines = paragraph.split("\n")
+        chunks: list[str] = []
+        current = ""
+
+        for line in lines:
+            line_parts = self._split_long_line(line)
+            for part in line_parts:
+                separator = "\n" if current else ""
+                candidate = current + separator + part if part else current + separator
+                if current and len(candidate) > self.max_length:
+                    chunks.append(current)
+                    current = part
+                else:
+                    current = candidate
+
+            # Preserve blank lines inside the paragraph. paragraph.split("\n") keeps
+            # them as empty strings, so we need to retain the separator they imply.
+            if line == "" and current and not current.endswith("\n"):
+                if len(current) + 1 > self.max_length:
+                    chunks.append(current)
+                    current = ""
+                else:
+                    current += "\n"
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _split_long_section(self, section: str) -> list[str]:
+        """Split a section that's longer than max_length while preserving line structure."""
+        heading_re = re.compile(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)')
+
+        chunks = []
+        paragraphs = section.split("\n\n")
+        current = ""
+
+        for para in paragraphs:
+            if len(current) + len(para) + 2 <= self.max_length:
+                current = current + "\n\n" + para if current else para
+                continue
+
+            if current:
+                # Don't strand a heading at the end of a chunk —
+                # move it to the next chunk with the upcoming content
+                lines = current.rsplit("\n\n", 1)
+                if len(lines) == 2 and heading_re.match(lines[1]):
+                    chunks.append(lines[0])
+                    current = lines[1]
+                else:
+                    chunks.append(current)
+                    current = ""
+
+            if len(para) <= self.max_length:
+                current = para
+                continue
+
+            para_chunks = self._split_oversize_paragraph(para)
+            if not para_chunks:
+                continue
+
+            chunks.extend(para_chunks[:-1])
+            current = para_chunks[-1]
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _fix_code_block_fences(self, chunks: list[str]) -> list[str]:
+        """Close/reopen code blocks that were split across chunks."""
+        fence_re = re.compile(r'^(`{3,})(\w*)', re.MULTILINE)
+
+        in_code = False
+        lang = ""
+        fence_char_count = 3
+
+        fixed = []
+        for chunk in chunks:
+            if in_code:
+                chunk = f"```{lang}\n" + chunk
+
+            fences = fence_re.findall(chunk)
+            for ticks, fence_lang in fences:
+                if not in_code:
+                    in_code = True
+                    lang = fence_lang
+                    fence_char_count = len(ticks)
+                else:
+                    if len(ticks) >= fence_char_count:
+                        in_code = False
+                        lang = ""
+
+            if in_code:
+                chunk = chunk + "\n```"
+
+            fixed.append(chunk)
+
+        return fixed
+
     def chunk_response(self, text: str) -> list[str]:
         """
         Split a response into chunks that fit Discord's message limit.
@@ -673,218 +888,3 @@ class ZoClient:
         text = re.sub(r'\n{3,}', '\n\n', text)
 
         return text.strip()
-
-    def _split_by_topics(self, text: str) -> list[str]:
-        """Split text into topic sections at meaningful boundaries."""
-        # Split on bold headers, markdown headers, horizontal rules, or numbered items after blank lines
-        pattern = r'\n\n(?=\*\*[^*]+\*\*[:\s]|#{1,3}\s|\-{3,}|\d+\.\s)'
-        parts = re.split(pattern, text)
-
-        # Remove empty parts and strip
-        sections = [p.strip() for p in parts if p.strip()]
-
-        # If no topic splits found, fall back to paragraph splitting
-        # but keep headings attached to the paragraph that follows them
-        if len(sections) <= 1:
-            paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-            sections = []
-            for para in paragraphs:
-                # If this paragraph is a heading, attach it to the next paragraph
-                if re.match(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)', para):
-                    sections.append(para)
-                elif sections and re.match(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)', sections[-1]):
-                    # Previous section was a bare heading — merge
-                    sections[-1] = sections[-1] + "\n\n" + para
-                else:
-                    sections.append(para)
-
-        return sections
-
-    def _split_long_section(self, section: str) -> list[str]:
-        """Split a section that's longer than max_length while preserving line structure."""
-        heading_re = re.compile(r'^(?:\*\*[^*]+\*\*[:\s]?|#{1,3}\s)')
-
-        chunks = []
-        paragraphs = section.split("\n\n")
-        current = ""
-
-        for para in paragraphs:
-            if len(current) + len(para) + 2 <= self.max_length:
-                current = current + "\n\n" + para if current else para
-                continue
-
-            if current:
-                # Don't strand a heading at the end of a chunk —
-                # move it to the next chunk with the upcoming content
-                lines = current.rsplit("\n\n", 1)
-                if len(lines) == 2 and heading_re.match(lines[1]):
-                    chunks.append(lines[0])
-                    current = lines[1]
-                else:
-                    chunks.append(current)
-                    current = ""
-
-            if len(para) <= self.max_length:
-                current = para
-                continue
-
-            para_chunks = self._split_oversize_paragraph(para)
-            if not para_chunks:
-                continue
-
-            chunks.extend(para_chunks[:-1])
-            current = para_chunks[-1]
-
-        if current:
-            chunks.append(current)
-        return chunks
-
-    def _split_oversize_paragraph(self, paragraph: str) -> list[str]:
-        """Split an oversize paragraph without collapsing single newlines."""
-        if self._is_fenced_code_block(paragraph):
-            return self._split_fenced_code_block(paragraph)
-
-        lines = paragraph.split("\n")
-        chunks: list[str] = []
-        current = ""
-
-        for line in lines:
-            line_parts = self._split_long_line(line)
-            for part in line_parts:
-                separator = "\n" if current else ""
-                candidate = current + separator + part if part else current + separator
-                if current and len(candidate) > self.max_length:
-                    chunks.append(current)
-                    current = part
-                else:
-                    current = candidate
-
-            # Preserve blank lines inside the paragraph. paragraph.split("\n") keeps
-            # them as empty strings, so we need to retain the separator they imply.
-            if line == "" and current and not current.endswith("\n"):
-                if len(current) + 1 > self.max_length:
-                    chunks.append(current)
-                    current = ""
-                else:
-                    current += "\n"
-
-        if current:
-            chunks.append(current)
-        return chunks
-
-    def _is_fenced_code_block(self, paragraph: str) -> bool:
-        lines = paragraph.split("\n")
-        if len(lines) < 2:
-            return False
-        return lines[0].startswith("```") and lines[-1].startswith("```")
-
-    def _split_fenced_code_block(self, paragraph: str) -> list[str]:
-        """Split a fenced code block into independently valid fenced chunks."""
-        lines = paragraph.split("\n")
-        opener = lines[0]
-        closer = lines[-1]
-        body_lines = lines[1:-1]
-        overhead = len(opener) + len(closer) + 2
-        body_limit = max(1, self.max_length - overhead)
-
-        chunks: list[str] = []
-        current_body = ""
-
-        for line in body_lines:
-            line_parts = self._split_long_line(line, max_length=body_limit)
-            for part in line_parts:
-                candidate = current_body + ("\n" if current_body else "") + part
-                if current_body and len(candidate) > body_limit:
-                    chunks.append(f"{opener}\n{current_body}\n{closer}")
-                    current_body = part
-                else:
-                    current_body = candidate
-
-        if current_body or not chunks:
-            chunks.append(f"{opener}\n{current_body}\n{closer}" if current_body else f"{opener}\n{closer}")
-
-        return chunks
-
-    def _split_long_line(self, line: str, max_length: int | None = None) -> list[str]:
-        """Split one long line, preserving spaces and inline code spans when possible."""
-        max_length = max_length or self.max_length
-        if len(line) <= max_length:
-            return [line]
-
-        tokens = self._tokenize_line_preserving_inline_code(line)
-        if not tokens:
-            return [line[i:i + max_length] for i in range(0, len(line), max_length)]
-
-        parts: list[str] = []
-        current = ""
-        for token in tokens:
-            if len(token) > max_length:
-                if current:
-                    parts.append(current.rstrip())
-                    current = ""
-                parts.extend(token[i:i + max_length] for i in range(0, len(token), max_length))
-                continue
-
-            if len(current) + len(token) <= max_length:
-                current += token
-            else:
-                if current:
-                    parts.append(current.rstrip())
-                current = token
-
-        if current:
-            parts.append(current.rstrip())
-
-        return parts or [line]
-
-    def _tokenize_line_preserving_inline_code(self, line: str) -> list[str]:
-        tokens: list[str] = []
-        index = 0
-        inline_code_re = re.compile(r'`[^`\n]*`')
-
-        for match in inline_code_re.finditer(line):
-            if match.start() > index:
-                tokens.extend(re.findall(r'\S+\s*', line[index:match.start()]))
-            tokens.append(match.group(0))
-            trailing_ws_match = re.match(r'\s*', line[match.end():])
-            if trailing_ws_match and trailing_ws_match.group(0):
-                tokens[-1] += trailing_ws_match.group(0)
-                index = match.end() + len(trailing_ws_match.group(0))
-            else:
-                index = match.end()
-
-        if index < len(line):
-            tokens.extend(re.findall(r'\S+\s*', line[index:]))
-
-        return tokens
-
-    def _fix_code_block_fences(self, chunks: list[str]) -> list[str]:
-        """Close/reopen code blocks that were split across chunks."""
-        fence_re = re.compile(r'^(`{3,})(\w*)', re.MULTILINE)
-
-        in_code = False
-        lang = ""
-        fence_char_count = 3
-
-        fixed = []
-        for chunk in chunks:
-            if in_code:
-                chunk = f"```{lang}\n" + chunk
-
-            fences = fence_re.findall(chunk)
-            for ticks, fence_lang in fences:
-                if not in_code:
-                    in_code = True
-                    lang = fence_lang
-                    fence_char_count = len(ticks)
-                else:
-                    if len(ticks) >= fence_char_count:
-                        in_code = False
-                        lang = ""
-
-            if in_code:
-                chunk = chunk + "\n```"
-
-            fixed.append(chunk)
-
-        return fixed
