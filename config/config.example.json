@@ -8,6 +8,7 @@
   "notification_port": 8787,
   "max_message_length": 1900,
   "data_dir": "discord_data",
+  "db_path": null,
   "thinking_mode": "streaming",
   "auto_archive_override": true,
   "buffer_seconds": 0

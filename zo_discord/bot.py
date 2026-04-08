@@ -3029,8 +3029,8 @@ def main():
         key_status = "\u2713 Set" if api_key else "\u2717 Not set"
         print(f"DISCORD_BOT_TOKEN: {token_status}")
         print(f"DISCORD_ZO_API_KEY: {key_status}")
-        from zo_discord import PROJECT_ROOT
-        print(f"Config: {PROJECT_ROOT / 'config' / 'config.json'}")
+        from zo_discord.paths import get_config_path
+        print(f"Config: {get_config_path()}")
 
         if not token or not api_key:
             print("\nAdd missing secrets at: Settings > Developers")

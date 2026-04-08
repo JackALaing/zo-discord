@@ -111,9 +111,9 @@ def _normalize_terminal_result(result: dict | None) -> dict | None:
         return None
     return result
 
-from zo_discord import PROJECT_ROOT
+from zo_discord.paths import get_config_path
 
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+CONFIG_PATH = get_config_path()
 
 # Streaming flush config
 FLUSH_MIN_SENTENCES = 3

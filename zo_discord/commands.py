@@ -14,13 +14,14 @@ from discord import ui
 from zo_discord import PROJECT_ROOT
 from zo_discord.db import get_channel_config, set_channel_config, get_conversation_id, update_conversation_id
 from zo_discord.hermes import is_hermes
+from zo_discord.paths import get_config_path, get_hermes_home
 from zo_discord.zo_client import load_config
 
 logger = logging.getLogger("zo_discord.commands")
 
 HERMES_BASE = "http://127.0.0.1:8788"
 
-HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
+HERMES_CONFIG_PATH = get_hermes_home() / "config.yaml"
 
 
 async def _hermes_post(path: str, payload: dict) -> tuple[int, dict]:
@@ -60,7 +61,7 @@ AVAILABLE_TOOLSETS = [
     "all", "debugging", "safe",
 ]
 
-CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
+CONFIG_PATH = get_config_path()
 
 
 async def _get_channel_backend(ctx: discord.ApplicationContext) -> str | None:

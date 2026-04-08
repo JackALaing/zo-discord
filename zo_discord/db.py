@@ -9,9 +9,15 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from zo_discord import PROJECT_ROOT
+from zo_discord.paths import get_db_path
 
-DB_PATH = PROJECT_ROOT / "data" / "threads.db"
+DB_PATH = get_db_path()
+
+
+def _refresh_db_path() -> Path:
+    global DB_PATH
+    DB_PATH = get_db_path()
+    return DB_PATH
 VALID_REASONING_LEVELS = {"off", "low", "medium", "high"}
 VALID_BACKENDS = {"zo", "hermes"}
 VALID_MESSAGE_MODES = {"queue", "interrupt"}
@@ -143,9 +149,10 @@ async def _apply_migrations(db) -> None:
 
 async def init_db():
     """Initialize the database schema."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db_path = _refresh_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db_path) as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS thread_mappings (
                 thread_id TEXT PRIMARY KEY,

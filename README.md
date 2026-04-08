@@ -94,6 +94,7 @@ Edit `config/config.json` with your IDs from step 2:
   "notification_port": 8787,
   "max_message_length": 1900,
   "data_dir": "discord_data",
+  "db_path": null,
   "thinking_mode": "streaming",
   "auto_archive_override": true,
   "buffer_seconds": 0
@@ -111,6 +112,7 @@ Edit `config/config.json` with your IDs from step 2:
 | `notification_port` | Port for the bot's internal HTTP API, used by agents and the CLI |
 | `max_message_length` | Max characters per Discord message before chunking. Don't change unless Discord change their API limits |
 | `data_dir` | Path for channel data and attachments. Defaults to `discord_data/` in the bot directory |
+| `db_path` | Optional SQLite path for thread/channel state. When omitted, defaults to `<data_dir>/threads.db` |
 | `thinking_mode` | `"streaming"` shows Zo's intermediate thinking; `"quiet"` shows only final responses |
 | `auto_archive_override` | `true` prevents Discord from auto-archiving threads; `false` uses channel defaults |
 | `buffer_seconds` | Seconds to wait after the last message before processing (0 = disabled). See [Message Buffering](#message-buffering) |
